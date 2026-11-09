@@ -1,6 +1,6 @@
 # NvmeHook — implementation plan
 
-Date: 2026-11-09. Driver version: 0.1.0 (planned).
+Date: 2026-11-09. Driver version: 1.1.0.
 
 A Lilu plugin that suppresses NVMe TRIM (Dataset Management / deallocate) for
 specific devices. Target device: an Intel Optane whose firmware drops off the bus

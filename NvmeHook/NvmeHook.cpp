@@ -8,24 +8,35 @@
 //  M1: counts discard traffic at the point where a storage discard becomes an
 //      NVMe Dataset Management command. Counters only: every request still runs
 //      through to the original implementation, byte for byte.
-//  M1.8: symbol resolution is fully symbol-name based and panic-free:
-//      Lilu's own resolution is broken for Tahoe kernel collections (kext and
+//  M1.8: Lilu's own resolution is broken for Tahoe kernel collections (kext and
 //      kernel symbols both fail; the kext kmod entries report address 0), and
-//      scanning kernel VM for the collection header faulted in the wild. This
-//      version anchors everything to a live object instead:
+//      scanning kernel VM for the collection header faulted in the wild.
+//      Everything is anchored to a live object instead: the first word of an
+//      IONVMeController is its vptr, an address inside IONVMeFamily, and the
+//      hooks are a fixed link-time distance away from it, so the KASLR slide
+//      cancels out.
+//  M1.9: the earlier version resolved those distances by reading
+//      BootKernelExtensions.kc through vnode_lookup/vn_rdwr from its own kernel
+//      thread. That path panicked in namei ("Taking non-sleepable RW lock with
+//      preemption enabled") when boot timing moved, because a bare kernel
+//      thread has no VFS context. The driver no longer touches the file
+//      system: the distances are constants measured from the same collection,
+//      and each candidate is fingerprinted (24 leading code bytes) before
+//      anything is routed. A build whose code does not match aborts with a
+//      status instead of patching, which is the one thing the symbol approach
+//      did better and the reason the fingerprints are checked at all.
 //
-//        1. wait for an IONVMeController instance (waitForMatchingService),
-//        2. its vtable pointer is an address inside IONVMeFamily,
-//        3. read the on-disk boot collection with vn_rdwr (kernel file reads
-//           cannot fault), find the IONVMeFamily slice and its LC_SYMTAB, and
-//           resolve hook symbols plus __ZTV/__ZTI16IONVMeController by name,
-//        4. slide = vptr - (__ZTV link value + 16), cross-checked against the
-//           type-info pointer stored immediately before the vptr,
-//        5. hook addresses = link value + slide; route with Lilu.
-//
-//      Nothing is hardcoded: every offset comes from the collection's symbol
-//      table at runtime, every address is validated before routing, and any
-//      failed check aborts with a status instead of patching.
+//  M2: the matched device loses every discard. The decision is taken in
+//      doUnmap, before the original acquires the work-loop gate, allocates the
+//      DSM buffer or takes a request from the pool, so the short-circuit is a
+//      complete no-op that leaves nothing to unwind. The identity is resolved
+//      once per device from the block storage device's own registry properties
+//      and cached in the counters table; unmatched devices, and devices whose
+//      identity is not published yet, pass through untouched.
+//      -nvmehooknoblock arms everything but blocks nothing, and
+//      -nvmehookcontrol matches the healthy control sample instead of the
+//      target, which is what makes suppression provable without the sample
+//      that dies under it.
 //
 //  The report is published to the IORegistry, not the kernel log: the ring
 //  buffer is overwritten by boot traffic within a minute, while registry
@@ -46,57 +57,75 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
+#include <libkern/OSAtomic.h>
 #include <libkern/libkern.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/stab.h>
-#include <sys/kauth.h>
-#include <sys/proc.h>
-#include <sys/uio.h>
-#include <sys/vm.h>
-#include <sys/vnode.h>
 
 static const char *bootargOff[] = { "-nvmehookoff" };
 static const char *bootargDebug[] = { "-nvmehookdbg" };
 static const char *bootargBeta[] = { "-nvmehookbeta" };
+// Beyond Lilu's own three: -nvmehooknoblock arms the hooks and counts but
+// never short-circuits a request, and -nvmehookcontrol selects the healthy
+// control sample as the matched device instead of the target. Both are read
+// once at plugin start, so no lookup happens on the request path.
+static const char *bootargNoBlock[] = { "-nvmehooknoblock" };
+static const char *bootargControl[] = { "-nvmehookcontrol" };
+
+// The device the block decision matches. Exactly one identity is active; the
+// decision is a single comparison against these strings, never a scattered set
+// of string tests. NVMe model and serial are both required: a model-only match
+// would hit every drive of the same type, including healthy ones.
+struct DeviceIdentity {
+	const char *role;
+	const char *model;
+	const char *serial;
+};
+
+static const DeviceIdentity identityTarget {"target", "INTEL SSDPD21K750GAM", "PHKD9344003J750F"};
+static const DeviceIdentity identityControl {"control", "WD_BLACK AN1500", "WUBT21431655"};
+static const DeviceIdentity *activeIdentity = &identityTarget;
+static bool blockingEnabled = true;
+
+static bool argumentPassed(const char **names, size_t count) {
+	for (size_t i = 0; i < count; i++)
+		if (checkKernelArgument(names[i]))
+			return true;
+	return false;
+}
 
 // Properties IONVMeFamily publishes on each controller.
 static const char *keyModel = "Model Number";
 static const char *keySerial = "Serial Number";
 static const char *keyVendor = "Vendor Identifier";
 
-// The boot collection on the sealed system volume. Only symbol offsets are
-// taken from it; the running base comes from the live object's vtable, so the
-// aux collection may add slices as long as the base kext binary is unchanged
-// (verified structurally by the type-info cross-check below).
-static constexpr char kcPath[] = "/System/Library/KernelCollections/BootKernelExtensions.kc";
+// Distance from an IONVMeController's vptr to each hook, measured in this
+// collection (macOS 26.7.2, 25G332, com.apple.iokit.IONVMeFamily). The vptr is
+// __ZTV16IONVMeController + 2 * sizeof(uintptr_t), so
+//
+//     hook = vptr + (hook link address - (__ZTV link address + 16))
+//
+// and the KASLR slide cancels out. A different build changes these numbers,
+// which is what the fingerprints below exist to catch.
+static constexpr int64_t kDeltaDoUnmap = -0x1AC8A;
+static constexpr int64_t kDeltaDoUnmapNVMe = -0x1AEB4;
+static constexpr int64_t kDeltaInitializeController = -0x28714;
 
-// Mangled symbol names, verified in the collection with IDA. These are the
-// only identities the hooks rely on; nothing here encodes an address.
-static constexpr const char *symNames[] {
-	"__ZN24IONVMeBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj",
-	"__ZN24IONVMeBlockStorageDevice11doUnmapNVMeEP16AppleNVMeRequestP26IOBlockStorageDeviceExtentjP17NVMeLBARangeEntry",
-	"__ZN16IONVMeController20InitializeControllerEv",
-	"__ZTV16IONVMeController",
+// The first 24 code bytes of each hook. Twenty-four and not sixteen: the two
+// block-device prologues share their first sixteen bytes and only diverge where
+// they save their arguments. Checked before routing, so a build that moved
+// these functions aborts instead of patching something else.
+static constexpr uint32_t kFingerprintLength = 24;
+static const uint8_t kFingerprintDoUnmap[kFingerprintLength] {
+	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+	0x53, 0x48, 0x83, 0xec, 0x28, 0x89, 0xcb, 0x41, 0x89, 0xd6, 0x49, 0x89,
 };
-static constexpr uint32_t kSymDoUnmap = 0;
-static constexpr uint32_t kSymDoUnmapNVMe = 1;
-static constexpr uint32_t kSymInitializeController = 2;
-static constexpr uint32_t kSymVtable = 3;
-static constexpr uint32_t kSymCount = 4;
-
-// kcgen's fileset entry command; not in the public headers. Layout:
-// cmd/cmdsize/vmaddr/fileoff/entry_id offset/reserved, identifier string at
-// command start + entry_id.
-struct FilesetEntryCommand {
-	uint32_t cmd;
-	uint32_t cmdsize;
-	uint64_t vmaddr;
-	uint64_t fileoff;
-	uint32_t entryId;
-	uint32_t reserved;
+static const uint8_t kFingerprintDoUnmapNVMe[kFingerprintLength] {
+	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+	0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0x75, 0xc0, 0x48, 0x89, 0x7d,
 };
-static constexpr uint32_t kLcFilesetEntry = 0x80000035;
+static const uint8_t kFingerprintInitializeController[kFingerprintLength] {
+	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89,
+	0xfb, 0x48, 0x8b, 0x07, 0xff, 0x90, 0x88, 0x0a, 0x00, 0x00, 0x85, 0xc0,
+};
 
 static mach_vm_address_t orgDoUnmap {0};
 static mach_vm_address_t orgDoUnmapNVMe {0};
@@ -108,12 +137,23 @@ static KernelPatcher *gPatcher {nullptr};
 struct Counters {
 	IOService *device {nullptr};
 	uint64_t seen {0};
+	uint64_t blocked {0};
 	uint64_t dsm {0};
+	uint32_t index {0};
+	bool identityKnown {false};
+	bool matched {false};
 };
 
 static constexpr uint32_t maxDevices = 8;
 static Counters counters[maxDevices] {};
 static uint32_t counterCount {0};
+
+// Counters are incremented from whatever thread issued the discard, and two
+// discards on one device can enter the hook concurrently (the original's
+// work-loop gate is taken later), so increments are atomic.
+static void bump(uint64_t *counter) {
+	OSAddAtomic64(1, reinterpret_cast<volatile SInt64 *>(counter));
+}
 
 static const char *stringProperty(IOService *service, const char *key) {
 	auto value = OSDynamicCast(OSString, service->getProperty(key));
@@ -132,8 +172,10 @@ static void publishAddress(const char *key, mach_vm_address_t address) {
 }
 
 // The block storage device keeps its identity in a "Device Characteristics"
-// dictionary; controllers publish the same pair as flat properties.
-static const char *identityProperty(IOService *service, const char *key, const char *dictKey) {
+// dictionary; controllers publish the same pair as flat properties. The block
+// device is what the hook actually receives, so its own copy is the one the
+// block decision reads: no controller pointer arithmetic on the request path.
+static const char *identityPropertyValue(IOService *service, const char *key, const char *dictKey) {
 	if (auto value = OSDynamicCast(OSString, service->getProperty(key)))
 		return value->getCStringNoCopy();
 
@@ -141,7 +183,24 @@ static const char *identityProperty(IOService *service, const char *key, const c
 		if (auto value = OSDynamicCast(OSString, dict->getObject(dictKey)))
 			return value->getCStringNoCopy();
 
-	return "<absent>";
+	return nullptr;
+}
+
+// NVMe Identify strings are space padded to a fixed field width and the
+// registry copy may keep that padding, so trailing blanks are ignored.
+// Everything else must match, and an empty string never matches: an absent
+// property must not turn into a wildcard.
+static bool identityEquals(const char *actual, const char *wanted) {
+	size_t actualLength = strlen(actual);
+	while (actualLength != 0 && (actual[actualLength - 1] == ' ' || actual[actualLength - 1] == '\t'))
+		actualLength--;
+
+	size_t wantedLength = strlen(wanted);
+	while (wantedLength != 0 && (wanted[wantedLength - 1] == ' ' || wanted[wantedLength - 1] == '\t'))
+		wantedLength--;
+
+	return actualLength != 0 && actualLength == wantedLength &&
+		   strncmp(actual, wanted, actualLength) == 0;
 }
 
 static Counters *countersFor(IOService *device) {
@@ -149,22 +208,48 @@ static Counters *countersFor(IOService *device) {
 		if (counters[i].device == device)
 			return &counters[i];
 
-	if (counterCount >= maxDevices)
-		return nullptr;
+	// A slot is claimed with a compare-and-swap so that two concurrent first
+	// discards cannot hand out the same index. A racing thread that reads the
+	// raised count before the slot is filled only sees a null device pointer,
+	// which the scan above skips.
+	uint32_t index = counterCount;
+	while (true) {
+		if (index >= maxDevices)
+			return nullptr;
+		if (OSCompareAndSwap(index, index + 1, &counterCount))
+			break;
+		index = counterCount;
+	}
 
-	auto c = &counters[counterCount];
+	auto c = &counters[index];
+	c->index = index;
 	c->device = device;
+	return c;
+}
+
+// Resolve and cache the block decision once per device. Device Characteristics
+// is published by SetNVMeProperties during device start, i.e. before any media
+// exists, so by the time a discard can arrive the answer is normally available
+// on the first call; if it is not, the decision stays open and is retried on
+// the next event instead of being guessed.
+static void resolveIdentity(Counters *c) {
+	const char *model = identityPropertyValue(c->device, keyModel, "Product Name");
+	const char *serial = identityPropertyValue(c->device, keySerial, keySerial);
+	if (model == nullptr || serial == nullptr)
+		return;
+
+	c->identityKnown = true;
+	c->matched = identityEquals(model, activeIdentity->model) &&
+				 identityEquals(serial, activeIdentity->serial);
 
 	char key[40];
-	snprintf(key, sizeof(key), "NvmeHookDevice%u", counterCount);
-	char value[320];
-	snprintf(value, sizeof(value), "model=%s; serial=%s",
-			 identityProperty(device, keyModel, "Product Name"),
-			 identityProperty(device, keySerial, keySerial));
+	snprintf(key, sizeof(key), "NvmeHookDevice%u", c->index);
+	char value[512];
+	snprintf(value, sizeof(value), "model=%s; serial=%s; match=%s%s", model, serial,
+			 c->matched ? activeIdentity->role : "none",
+			 c->matched && !blockingEnabled ? " (blocking disabled)" : "");
 	publishStatus(key, value);
-
-	counterCount++;
-	return c;
+	SYSLOG("nvmehook", "device %u: %s", c->index, value);
 }
 
 // Registry writes take locks, so they are kept off the hot path: the first few
@@ -174,44 +259,67 @@ static void publishCounters(Counters *c) {
 	if (total > 16 && (total & 0x3F) != 0)
 		return;
 
-	char value[96];
-	snprintf(value, sizeof(value), "seen=%llu; dsm=%llu", c->seen, c->dsm);
+	char value[128];
+	snprintf(value, sizeof(value), "seen=%llu; blocked=%llu; dsm=%llu",
+			 c->seen, c->blocked, c->dsm);
 	c->device->setProperty("NvmeHookCounters", value);
 }
 
 static void publishTotal() {
 	uint64_t seen = 0;
+	uint64_t blocked = 0;
 	uint64_t dsm = 0;
 	for (uint32_t i = 0; i < counterCount; i++) {
 		seen += counters[i].seen;
+		blocked += counters[i].blocked;
 		dsm += counters[i].dsm;
 	}
 
-	char value[64];
-	snprintf(value, sizeof(value), "seen=%llu; dsm=%llu", seen, dsm);
+	char value[96];
+	snprintf(value, sizeof(value), "seen=%llu; blocked=%llu; dsm=%llu", seen, blocked, dsm);
 	publishStatus("NvmeHookTotal", value);
 }
 
+// The suppression point. doUnmap is where a storage discard becomes a DSM
+// command, and the original does four things before it submits anything: take
+// the work-loop gate, allocate and map the 4 KiB DSM buffer, increment the
+// device's unmap statistic, and take a request from the pool. Short-circuiting
+// at entry skips all four, so there is no half-built request and no state to
+// unwind; the caller sees a success, which is what a suppressed discard is.
+// Unmatched devices, and devices whose identity is not published yet, reach the
+// trampoline unchanged.
 static IOReturn doUnmapHook(void *self, IOBlockStorageDeviceExtent *extents,
 							uint32_t extentsCount, uint32_t options) {
 	auto device = static_cast<IOService *>(self);
 	if (auto c = countersFor(device)) {
-		c->seen++;
+		bump(&c->seen);
+		if (!c->identityKnown)
+			resolveIdentity(c);
+
+		bool block = c->identityKnown && c->matched && blockingEnabled;
+		if (block)
+			bump(&c->blocked);
+
 		publishCounters(c);
 		publishTotal();
+
+		if (block)
+			return kIOReturnSuccess;
 	}
 
 	auto org = reinterpret_cast<IOReturn (*)(void *, IOBlockStorageDeviceExtent *, uint32_t, uint32_t)>(orgDoUnmap);
 	return org(self, extents, extentsCount, options);
 }
 
-// The request object and the LBA range entry array are opaque here: M1 passes
-// them through untouched and only counts the calls.
+// The command that actually leaves for the hardware, and the ground truth for
+// the suppression gate: on a blocked device this counter must stay flat while
+// `blocked` tracks `seen`. The request object and the LBA range entry array are
+// opaque here; this hook counts and never alters behaviour.
 static IOReturn doUnmapNVMeHook(void *self, void *request, IOBlockStorageDeviceExtent *extents,
 								uint32_t extentsCount, void *rangeEntry) {
 	auto device = static_cast<IOService *>(self);
 	if (auto c = countersFor(device)) {
-		c->dsm++;
+		bump(&c->dsm);
 		publishCounters(c);
 		publishTotal();
 	}
@@ -220,31 +328,21 @@ static IOReturn doUnmapNVMeHook(void *self, void *request, IOBlockStorageDeviceE
 	return org(self, request, extents, extentsCount, rangeEntry);
 }
 
-// Per-device identity match, per the plan: model AND serial, both from the
-// controller's registry properties. Only the named 750 GB Optane sample is the
-// target; every other controller — the healthy WD_BLACK AN1500 control device
-// included — reports as a pass-through. Blocking is a later milestone; for now
-// this only logs the match.
-static const char *targetModel = "INTEL SSDPD21K750GAM";
-static const char *targetSerial = "PHKD9344003J750F";
-
-static bool isTargetController(IOService *controller) {
-	auto model = stringProperty(controller, keyModel);
-	auto serial = stringProperty(controller, keySerial);
-	return strncmp(model, targetModel, strlen(targetModel) + 1) == 0 &&
-		   strncmp(serial, targetSerial, strlen(targetSerial) + 1) == 0;
-}
-
+// Controller-level identity report, from the controller's own properties. The
+// hook above decides per block storage device; this one says, once per start,
+// whether the active identity is present on the bus at all.
 static void reportControllerIdentity(IOService *controller) {
 	const char *model = stringProperty(controller, keyModel);
 	const char *serial = stringProperty(controller, keySerial);
-	bool target = isTargetController(controller);
+	bool matched = identityEquals(model, activeIdentity->model) &&
+				   identityEquals(serial, activeIdentity->serial);
 
-	char report[256];
-	if (target) {
+	char report[320];
+	if (matched) {
 		snprintf(report, sizeof(report),
-				 "TRIM-suppression target attached (model=%s; serial=%s); "
-				 "blocking stage not enabled yet", model, serial);
+				 "matched %s controller (model=%s; serial=%s); %s", activeIdentity->role, model, serial,
+				 blockingEnabled ? "discards are suppressed"
+								 : "blocking disabled by -nvmehooknoblock");
 	} else {
 		snprintf(report, sizeof(report),
 				 "pass-through controller (model=%s; serial=%s)", model, serial);
@@ -261,206 +359,25 @@ static IOReturn initializeControllerHook(void *self) {
 	reportControllerIdentity(static_cast<IOService *>(self));
 	return result;
 }
-// ---------------------------------------------------------------------------
-// Boot collection parsing. All reads go through vn_rdwr against the on-disk
-// collection: kernel file reads return errors instead of faulting, so a wrong
-// offset can never panic the machine.
-// ---------------------------------------------------------------------------
-
-static bool readKcBytes(vnode_t vp, void *buffer, uint32_t length, uint64_t offset) {
-	int resid = 0;
-	auto error = vn_rdwr(UIO_READ, vp, reinterpret_cast<caddr_t>(buffer),
-						 length, static_cast<off_t>(offset), UIO_SYSSPACE,
-						 0, kauth_cred_get(), &resid, current_proc());
-	return error == 0 && resid == 0;
-}
-
-// Parse the collection, find the IONVMeFamily slice, and resolve every symbol
-// in symNames to its link-time address. Returns false on any structural
-// surprise; every allocation is freed before returning. stage reports where.
-static bool resolveKcSymbols(uint64_t *links, uint64_t &textVmaddrOut, uint64_t &textVmSizeOut,
-							 uint64_t &sliceLoOut, uint64_t &sliceHiOut, const char *&stage) {
-	vnode_t vp = nullptr;
-	stage = "vnode-lookup";
-	if (vnode_lookup(kcPath, 0, &vp, vfs_context_current()) != 0)
-		return false;
-
-	bool ok = false;
-	uint8_t *headerBlock = nullptr;
-	uint8_t *sliceBlock = nullptr;
-	uint8_t *symtab = nullptr;
-	uint8_t *strtab = nullptr;
-	uint64_t strtabSize = 0;
-	uint64_t symtabSize = 0;
-
-	auto cleanup = [&]() {
-		if (headerBlock) IOFree(headerBlock, 256 * 1024);
-		if (sliceBlock) IOFree(sliceBlock, 4096);
-		if (strtab) IOFree(strtab, strtabSize);
-		if (symtab) IOFree(symtab, symtabSize);
-		vnode_put(vp);
-	};
-
-	stage = "alloc-header";
-	headerBlock = reinterpret_cast<uint8_t *>(IOMalloc(256 * 1024));
-	if (headerBlock == nullptr)
-		goto out;
-	stage = "read-header";
-	if (!readKcBytes(vp, headerBlock, 256 * 1024, 0))
-		goto out;
-
-	{
-		auto header = reinterpret_cast<mach_header_64 *>(headerBlock);
-		if (header->magic != MH_MAGIC_64 || header->ncmds < 128) {
-			// Not the collection header we know: the real one carries ~830
-			// load commands, most of them fileset entries.
-			stage = "bad-header";
-			goto out;
-		}
-
-		uint64_t sliceFileoff = 0;
-		auto cmd = headerBlock + sizeof(mach_header_64);
-		for (uint32_t i = 0; i < header->ncmds; i++) {
-			auto loadCmd = reinterpret_cast<const load_command *>(cmd);
-			if (loadCmd->cmdsize < sizeof(load_command) ||
-				cmd + loadCmd->cmdsize > headerBlock + 256 * 1024)
-				goto out;
-
-			if (loadCmd->cmd == kLcFilesetEntry) {
-				auto entry = reinterpret_cast<const FilesetEntryCommand *>(cmd);
-				auto id = reinterpret_cast<const char *>(cmd) + entry->entryId;
-				if (strncmp(id, "com.apple.iokit.IONVMeFamily", 30) == 0) {
-					sliceFileoff = entry->fileoff;
-					break;
-				}
-			}
-			cmd += loadCmd->cmdsize;
-		}
-
-		if (sliceFileoff == 0) {
-			stage = "no-fileset-entry";
-			goto out;
-		}
-
-		sliceBlock = reinterpret_cast<uint8_t *>(IOMalloc(4096));
-		if (sliceBlock == nullptr) {
-			stage = "alloc-slice";
-			goto out;
-		}
-		if (!readKcBytes(vp, sliceBlock, 4096, sliceFileoff)) {
-			stage = "read-slice";
-			goto out;
-		}
-
-		auto slice = reinterpret_cast<mach_header_64 *>(sliceBlock);
-		if (slice->magic != MH_MAGIC_64 || slice->filetype != MH_KEXT_BUNDLE) {
-			stage = "bad-slice";
-			goto out;
-		}
-
-		segment_command_64 *text = nullptr;
-		symtab_command *symtabCmd = nullptr;
-		uint64_t spanLo = UINT64_MAX;
-		uint64_t spanHi = 0;
-		auto sliceCmd = sliceBlock + sizeof(mach_header_64);
-		for (uint32_t i = 0; i < slice->ncmds; i++) {
-			auto loadCmd = reinterpret_cast<const load_command *>(sliceCmd);
-			if (loadCmd->cmdsize < sizeof(load_command) ||
-				sliceCmd + loadCmd->cmdsize > sliceBlock + 4096)
-				goto out;
-
-			if (loadCmd->cmd == LC_SEGMENT_64) {
-				auto seg = reinterpret_cast<const segment_command_64 *>(sliceCmd);
-				if (strncmp(seg->segname, "__TEXT", sizeof(seg->segname)) == 0 && text == nullptr)
-					text = const_cast<segment_command_64 *>(seg);
-				if (seg->vmsize > 0) {
-					if (seg->vmaddr < spanLo)
-						spanLo = seg->vmaddr;
-					if (seg->vmaddr + seg->vmsize > spanHi)
-						spanHi = seg->vmaddr + seg->vmsize;
-				}
-			} else if (loadCmd->cmd == LC_SYMTAB) {
-				auto st = reinterpret_cast<const symtab_command *>(sliceCmd);
-				if (st->symoff != 0 && st->nsyms != 0 && symtabCmd == nullptr)
-					symtabCmd = const_cast<symtab_command *>(st);
-			}
-			sliceCmd += loadCmd->cmdsize;
-		}
-
-		if (text == nullptr || symtabCmd == nullptr) {
-			stage = "no-text-or-symtab";
-			goto out;
-		}
-		if (symtabCmd->nsyms > 200000 || symtabCmd->strsize > 64 * 1024 * 1024) {
-			stage = "implausible-symtab";
-			goto out;
-		}
-
-		symtabSize = static_cast<uint64_t>(symtabCmd->nsyms) * sizeof(nlist_64);
-		strtabSize = symtabCmd->strsize;
-
-		symtab = reinterpret_cast<uint8_t *>(IOMalloc(symtabSize));
-		strtab = reinterpret_cast<uint8_t *>(IOMalloc(strtabSize));
-		if (symtab == nullptr || strtab == nullptr) {
-			stage = "alloc-symtab";
-			goto out;
-		}
-		if (!readKcBytes(vp, symtab, static_cast<uint32_t>(symtabSize), symtabCmd->symoff) ||
-			!readKcBytes(vp, strtab, symtabCmd->strsize, symtabCmd->stroff)) {
-			stage = "read-symtab";
-			goto out;
-		}
-
-		uint32_t found = 0;
-		auto entries = reinterpret_cast<const nlist_64 *>(symtab);
-		auto strings = reinterpret_cast<const char *>(strtab);
-		for (uint32_t i = 0; i < symtabCmd->nsyms; i++) {
-			if (entries[i].n_type & N_STAB)
-				continue;
-			auto candidate = strings + entries[i].n_un.n_strx;
-			for (uint32_t s = 0; s < kSymCount; s++) {
-				if (links[s] != 0)
-					continue;
-				if (strncmp(candidate, symNames[s], strlen(symNames[s]) + 1) == 0) {
-					links[s] = entries[i].n_value;
-					found++;
-				}
-			}
-			if (found == kSymCount)
-				break;
-		}
-		if (found != kSymCount) {
-			stage = "symbols-missing";
-			goto out;
-		}
-
-		// The three hook targets must be text; vtable/type-info are data in
-		// the slice, so they are only required to be non-zero.
-		for (uint32_t s = 0; s <= kSymInitializeController; s++) {
-			if (links[s] < text->vmaddr || links[s] >= text->vmaddr + text->vmsize) {
-				stage = "symbol-out-of-text";
-				goto out;
-			}
-		}
-
-		textVmaddrOut = text->vmaddr;
-		textVmSizeOut = text->vmsize;
-		sliceLoOut = spanLo;
-		sliceHiOut = spanHi;
-		ok = true;
-	}
-
-out:
-	cleanup();
-	return ok;
+// Read the leading code bytes of a resolved hook and compare them with the
+// fingerprint measured on the build these distances came from. Reading the
+// candidate is safe by construction: it is a small constant offset from a live
+// vptr, so it lands in the same image that pointer belongs to.
+static bool fingerprintMatches(mach_vm_address_t address, const uint8_t *expected) {
+	auto bytes = reinterpret_cast<const uint8_t *>(address);
+	for (uint32_t i = 0; i < kFingerprintLength; i++)
+		if (bytes[i] != expected[i])
+			return false;
+	return true;
 }
 
 // Resolve every interception point and route the hooks. Runs on a worker
-// thread once an IONVMeController exists, because the running base is derived
-// from its vtable. Every controller instance is probed against the collection
-// symbol table: the first published controller is not necessarily driven by
-// IONVMeFamily (this machine also carries a WD RAID card), and only the
-// type-info anchor proves which one is.
+// thread once an IONVMeController exists, because every address is expressed
+// relative to that live object's vtable pointer. Instances are probed in turn:
+// the first published controller is not necessarily driven by IONVMeFamily
+// (this machine has also carried a RAID card), and a subclass would have a
+// different vtable at a different distance, so the fingerprints decide which
+// instance is the anchor, not the enumeration order.
 static void workerThread(void *, wait_result_t) {
 	auto matching = IOService::serviceMatching("IONVMeController");
 	if (matching == nullptr) {
@@ -505,91 +422,74 @@ static void workerThread(void *, wait_result_t) {
 	snprintf(count, sizeof(count), "%u", instanceCount);
 	publishStatus("NvmeHookInstanceCount", count);
 
-	// DirectLink target detection covers every controller: the Samsung 990 may
-	// sit behind any of them.
+	// The identity report covers every controller: the matched device may sit
+	// behind any of them, and the registry publishes model and serial per
+	// controller, not per family.
 	for (uint32_t i = 0; i < instanceCount; i++)
 		reportControllerIdentity(instances[i]);
 
-	uint64_t links[kSymCount] {};
-	uint64_t sliceTextLink = 0;
-	uint64_t sliceTextSize = 0;
-	uint64_t sliceLo = 0;
-	uint64_t sliceHi = 0;
-	const char *stage = "unknown";
-	bool parsed = false;
-	mach_vm_address_t chosenVptr {0};
-	int64_t chosenSlide {0};
-	for (uint32_t attempt = 0; attempt < 60 && !parsed; attempt++) {
-		if (resolveKcSymbols(links, sliceTextLink, sliceTextSize, sliceLo, sliceHi, stage)) {
-			parsed = true;
-		} else {
-			publishStatus("NvmeHookKcStage", stage);
-			IOSleep(1000);
-		}
-	}
-	if (!parsed) {
-		char state[160];
-		snprintf(state, sizeof(state), "collection parse failed at %s, nothing patched", stage);
-		publishStatus("NvmeHookHooks", state);
-		goto releaseInstances;
-	}
-	publishStatus("NvmeHookKcStage", "ok");
+	mach_vm_address_t anchor {0};
+	mach_vm_address_t addressDoUnmap {0};
+	mach_vm_address_t addressDoUnmapNVMe {0};
+	mach_vm_address_t addressInitializeController {0};
 
-	// Probe every instance: the vptr must sit exactly one type-info slot past
-	// the vtable symbol, the vptr itself must land inside the slice (the
-	// vtable lives in __DATA), and the function pointers stored in the first
-	// vtable slots must land inside the slice's __TEXT after the slide is
-	// removed. The first instance that validates is our anchor.
-	for (uint32_t i = 0; i < instanceCount && chosenVptr == 0; i++) {
+	// Probe every instance. The candidates are constant distances from the
+	// vptr, so they are inside the same image whatever the slide is; the
+	// fingerprints then say whether this image is the build the distances were
+	// measured on. The first instance that matches is the anchor.
+	for (uint32_t i = 0; i < instanceCount && anchor == 0; i++) {
 		auto vptr = *reinterpret_cast<uintptr_t *>(instances[i]);
-		auto slide = static_cast<int64_t>(vptr) -
-					 static_cast<int64_t>(links[kSymVtable] + 2 * sizeof(uintptr_t));
+		auto candidateDoUnmap = static_cast<mach_vm_address_t>(
+			static_cast<int64_t>(vptr) + kDeltaDoUnmap);
+		auto candidateDoUnmapNVMe = static_cast<mach_vm_address_t>(
+			static_cast<int64_t>(vptr) + kDeltaDoUnmapNVMe);
+		auto candidateInitializeController = static_cast<mach_vm_address_t>(
+			static_cast<int64_t>(vptr) + kDeltaInitializeController);
 
-		char probe[192];
-		snprintf(probe, sizeof(probe), "i=%u slide=0x%llx vptr-ztv=0x%llx",
-				 i, static_cast<long long>(slide),
-				 static_cast<unsigned long long>(vptr - links[kSymVtable]));
-		publishStatus("NvmeHookProbe", probe);
-
-		if (slide < 0 || (slide & 0xFFF) != 0 || slide > 0x1000000000ULL)
-			continue;
-
-		auto inSlice = [&](uintptr_t link) {
-			return link >= sliceLo && link < sliceHi;
+		// The vtable is mapped by definition, and its first entry is a method
+		// in the same image. Anything further than 4 MB from that method is not
+		// this image, so it is skipped instead of being read: a fingerprint
+		// read is only safe inside a mapping we know exists.
+		auto firstMethod = static_cast<int64_t>(reinterpret_cast<const uintptr_t *>(vptr)[0]);
+		auto nearAnchorImage = [&](mach_vm_address_t candidate) {
+			auto delta = static_cast<int64_t>(candidate) - firstMethod;
+			return delta > -0x400000 && delta < 0x400000;
 		};
-		auto inText = [&](uintptr_t link) {
-			return link >= sliceTextLink && link < sliceTextLink + sliceTextSize;
-		};
-		if (!inSlice(vptr - slide))
+
+		bool near = nearAnchorImage(candidateDoUnmap) &&
+					nearAnchorImage(candidateDoUnmapNVMe) &&
+					nearAnchorImage(candidateInitializeController);
+		bool matched = near &&
+					   fingerprintMatches(candidateDoUnmap, kFingerprintDoUnmap) &&
+					   fingerprintMatches(candidateDoUnmapNVMe, kFingerprintDoUnmapNVMe) &&
+					   fingerprintMatches(candidateInitializeController, kFingerprintInitializeController);
+
+		char probe[224];
+		snprintf(probe, sizeof(probe),
+				 "i=%u vptr=0x%llx doUnmap=0x%llx doUnmapNVMe=0x%llx init=0x%llx fingerprint=%s",
+				 i, static_cast<unsigned long long>(vptr),
+				 static_cast<unsigned long long>(candidateDoUnmap),
+				 static_cast<unsigned long long>(candidateDoUnmapNVMe),
+				 static_cast<unsigned long long>(candidateInitializeController),
+				 !near ? "skipped (foreign image)" : (matched ? "match" : "mismatch"));
+		publishStatus("NvmeHookAnchor", probe);
+
+		if (!matched)
 			continue;
-		auto fn0 = *reinterpret_cast<uintptr_t *>(vptr);
-		auto fn1 = *reinterpret_cast<uintptr_t *>(vptr + sizeof(uintptr_t));
-		snprintf(probe, sizeof(probe), "i=%u fn0=0x%llx fn1=0x%llx fn0-s=0x%llx fn1-s=0x%llx",
-				 i, static_cast<unsigned long long>(fn0), static_cast<unsigned long long>(fn1),
-				 static_cast<unsigned long long>(fn0 - slide),
-				 static_cast<unsigned long long>(fn1 - slide));
-		publishStatus("NvmeHookFnProbe", probe);
-		if (!inText(fn0 - slide) || !inText(fn1 - slide))
-			continue;
-		chosenVptr = vptr;
-		chosenSlide = slide;
+
+		anchor = static_cast<mach_vm_address_t>(vptr);
+		addressDoUnmap = candidateDoUnmap;
+		addressDoUnmapNVMe = candidateDoUnmapNVMe;
+		addressInitializeController = candidateInitializeController;
 	}
 
-	if (chosenVptr == 0) {
-		publishStatus("NvmeHookHooks", "no controller validates the vtable anchor, nothing patched");
+	if (anchor == 0) {
+		publishStatus("NvmeHookHooks", "no controller matches the measured layout, nothing patched");
 		goto releaseInstances;
 	}
 
 	{
-		auto slide = chosenSlide;
-		publishStatus("NvmeHookSlide", "resolved");
-		publishAddress("NvmeHookKextBase", sliceTextLink + slide);
-		publishAddress("NvmeHookVptr", chosenVptr);
-
-		auto addressDoUnmap = links[kSymDoUnmap] + slide;
-		auto addressDoUnmapNVMe = links[kSymDoUnmapNVMe] + slide;
-		auto addressInitializeController = links[kSymInitializeController] + slide;
-
+		publishAddress("NvmeHookVptr", anchor);
 		publishAddress("NvmeHookSymDoUnmap", addressDoUnmap);
 		publishAddress("NvmeHookSymDoUnmapNVMe", addressDoUnmapNVMe);
 		publishAddress("NvmeHookSymInitializeController", addressInitializeController);
@@ -601,13 +501,17 @@ static void workerThread(void *, wait_result_t) {
 		orgInitializeController = gPatcher->routeFunction(addressInitializeController,
 														  reinterpret_cast<mach_vm_address_t>(initializeControllerHook), true);
 
-		char state[128];
+		// doUnmap is the hook that can drop a request, so it is named first and
+		// called out separately: if it failed to route while the counter hook
+		// succeeded, the driver is reporting traffic it cannot suppress.
+		char state[192];
 		if (orgDoUnmap != 0 && orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
-			snprintf(state, sizeof(state), "armed by symbol: counters + InitializeController");
-		} else if (orgDoUnmap != 0 && orgDoUnmapNVMe != 0) {
-			snprintf(state, sizeof(state), "counters armed; InitializeController unresolved");
-		} else if (orgDoUnmap != 0 || orgDoUnmapNVMe != 0) {
-			snprintf(state, sizeof(state), "partial: one counter hook failed to route");
+			snprintf(state, sizeof(state), "armed by anchor: doUnmap (blocking %s) + counters + InitializeController",
+					 blockingEnabled ? "on" : "off");
+		} else if (orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
+			snprintf(state, sizeof(state), "counters armed but doUnmap unresolved, nothing is blocked");
+		} else if (orgDoUnmapNVMe != 0) {
+			snprintf(state, sizeof(state), "counters armed; doUnmap and InitializeController unresolved");
 		} else {
 			snprintf(state, sizeof(state), "routing failed, nothing patched");
 		}
@@ -668,14 +572,27 @@ static void patchersReady(void *, KernelPatcher &patcher) {
 }
 
 static void chefStart() {
+	if (argumentPassed(bootargControl, arrsize(bootargControl)))
+		activeIdentity = &identityControl;
+	if (argumentPassed(bootargNoBlock, arrsize(bootargNoBlock)))
+		blockingEnabled = false;
+
 	publishStatus("NvmeHookVersion", xStringify(MODULE_VERSION));
-	publishStatus("NvmeHookPatches", "counters only, symbol-resolved (M1.8)");
-	publishStatus("NvmeHookTotal", "seen=0; dsm=0");
+	publishStatus("NvmeHookPatches", blockingEnabled
+					  ? "discard suppression for the matched device, anchor-resolved (M2)"
+					  : "counters only, anchor-resolved (-nvmehooknoblock)");
+	publishStatus("NvmeHookTotal", "seen=0; blocked=0; dsm=0");
+
+	char identity[192];
+	snprintf(identity, sizeof(identity), "match=%s model=%s serial=%s; blocking %s",
+			 activeIdentity->role, activeIdentity->model, activeIdentity->serial,
+			 blockingEnabled ? "enabled" : "disabled by -nvmehooknoblock");
+	publishStatus("NvmeHookBlocking", identity);
+
 	reportBus();
 	lilu.onPatcherLoad(patchersReady);
 
-	SYSLOG("nvmehook", "%s %s loaded; symbol-resolved hooks, no request is altered",
-		   xStringify(PRODUCT_NAME), xStringify(MODULE_VERSION));
+	SYSLOG("nvmehook", "%s %s loaded; %s", xStringify(PRODUCT_NAME), xStringify(MODULE_VERSION), identity);
 }
 
 PluginConfiguration ADDPR(config) = {

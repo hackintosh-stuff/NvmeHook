@@ -31,7 +31,7 @@ ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # Single place for the version: it feeds the Info.plist and MODULE_VERSION.
 NAME=NvmeHook
 BUNDLE_ID=com.ling.NvmeHook
-VERSION=1.0.0
+VERSION=1.2.0
 
 SDK_ARG=${MACKERNELSDK:-}
 LILU_ARG=${LILU:-}
