@@ -1,220 +1,241 @@
-# Handoff
+# NvmeHook — handoff notes
 
-Date: 2026-11-09. Written to move this work to another agent without re-deriving
-what has already been established. `PLAN.md` holds the design and the test plan;
-this file holds state, access, and the mistakes already paid for.
+Date: 2026-11-09. Driver version: 1.0.0 (deployed and verified on the target
+machine). Read `PLAN.md` (what and why), `AGENTS.md` (repo conventions and test
+device rules) and `DEBUG.md` (driver shape, IORegistry report, debugging)
+before touching anything. This file carries what those three do not: the state
+of the deployed driver, the macOS 26 symbol-resolution design with its dead
+ends, the operational procedures, and the next milestone.
 
-## 1. Objective
+## 1. Where things live
 
-A Lilu plugin that stops NVMe TRIM from ever reaching one specific device: an
-Intel Optane `SSDPD21K750GAM`, serial `PHKD9344003J750F`, 750 GB, whose firmware
-drops off the bus when it receives TRIM, hanging the machine. Every other NVMe
-device must keep TRIM unchanged.
-
-That device is **not attached** to the machine at the time of writing. The only
-NVMe present is the control device (section 4).
-
-## 2. Constraints that are not negotiable
-
-- **Lilu and this plugin live on the ESP only.** Nothing of either is written to
-  `/Library/Extensions` or any other system volume. See `AGENTS.md`.
-- The active ESP is the **internal SATA disk's** EFI partition. Never write
-  OpenCore files to a USB disk's EFI. The USB sticks are install and rescue media.
-- **Only the 750 GB sample is faulty.** The 32 GB array is healthy and verified
-  working; do not treat it as a suspect, and do not use "the array is also Optane"
-  to explain away a driver defect.
-- The goal is per-device suppression. A global TRIM disable is not the answer,
-  even though OpenCore's `Kernel > Quirks > SetApfsTrimTimeout = -1` can do it.
-- Documentation conventions are in `AGENTS.md`: `README.md` states current truth,
-  `DEBUG.md` carries implementation and debugging detail, and neither is a log.
-
-## 3. Repository
-
-Windows path: `C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\drivers_src\NvmeHook`
-(branch `master`, `origin/master` present).
-
-Working tree state at handoff — **all of this is uncommitted**:
-
-| Path | State |
+| Location | Role |
 |---|---|
-| `AGENTS.md` | modified (deployment and test-device constraints added) |
-| `PLAN.md` | new, untracked |
-| `NvmeHook/NvmeHook.cpp` | new, untracked |
-| `NvmeHook/Info.plist` | new, untracked |
-| `Scripts/build-noxcode.sh` | new, untracked |
-| `README.md`, `DEBUG.md` | modified: they state the M0 result |
-| `HANDOFF.md` | untracked: this file. It is not in git; keep a copy if it matters. |
-| `MacKernelSDK` | submodule, pinned at `3f75008` |
-| `_scratch/` | ignored: Lilu source clone, config plists, helper scripts |
+| `C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\drivers_src\NvmeHook` | Canonical repo (git). All source edits happen here. |
+| `ling@192.168.50.204:~/src/NvmeHook` | Build copy on the macOS machine. `NvmeHook.cpp` and `Scripts/build-noxcode.sh` are synced from the repo by hand (scp) before every build — do not assume they match the repo. |
+| `ling@192.168.50.204:~/src/Lilu` | Lilu source tree the build requires. |
+| Target machine ESP, `disk2s1` | `EFI/OC/Kexts/NvmeHook.kext` + `EFI/OC/config.plist`. disk2s1 is the internal SATA disk's EFI — the only ESP that may be written; the other EFI partitions belong to USB media. |
 
-Committing is safe and nothing else is in flight. `_scratch/` is gitignored and
-holds a full Lilu 1.7.2 checkout plus the OpenCore config copies described below.
+SSH access from the Windows side: `ssh -i C:\Users\ling\.ssh\id_rsa
+ling@192.168.50.204` (key auth, no password). sudo on that box is passwordless.
 
-## 4. Machine
+The deployed binary is built from the repo sources at version 1.0.0. The repo's
+`README.md` and `DEBUG.md` still describe milestone M0 and are out of date on
+the driver's shape (see §5 — updating them is part of the next milestone).
 
-| Item | Value |
-|---|---|
-| macOS | 26.7.2 (Darwin 25), x86_64 |
-| SSH | `ling@192.168.50.204`, key auth, `sudo` NOPASSWD |
-| Boot disk | `disk2`, SanDisk SD8SNAT-128G, internal SATA, APFS |
-| Active ESP | `disk2s1`, mounts at `/Volumes/EFI` |
-| OpenCore | in `EFI/OC`, loads Lilu, `AMDMapperHook`, AMD kexts |
-| `IONVMeFamily` | 2.1.0 |
-| Lilu | 1.7.2, injected by OpenCore, **not** on disk |
-| Control NVMe | `disk0` `WD_BLACK AN1500`, serial `WUBT21431655`, two 16 GB Optane M10 in a set, APFS volume `Optane_32G` mounted, TRIM on, healthy |
-| Target NVMe | absent |
-| USB `disk4` | install media + `OCRESCUE`, do not modify |
-| NanoKVM | `192.168.50.155`, root, known_hosts at `MSI_X570/tools/ssh/nanokvm_known_hosts`; power is the recovery path |
+## 2. What is deployed and what is verified
 
-SSH must use `-o BatchMode=yes -o StrictHostKeyChecking=yes`. The Mac's clock is
-in US Pacific time, so its timestamps run 16 hours behind Asia/Shanghai; do not
-mistake that for a stale log.
+The deployed 1.0.0 does **M1 only**: it hooks two IONVMeFamily functions and
+counts; no request is altered. Verified on the machine (IORegistry on
+`IOResources`, one entry per boot):
 
-## 5. Build
+```
+NvmeHookVersion                 = 1.0.0
+NvmeHookPatches                 = counters only, symbol-resolved (M1.8)
+NvmeHookHooks                   = armed by symbol: counters + InitializeController
+NvmeHookKextBase                = 0xffffff80162bd000   (slide 0x13c00000 this boot)
+NvmeHookSymDoUnmap              = 0xffffff80162d0396   (link 0x26d0396 + slide)
+NvmeHookSymDoUnmapNVMe          = 0xffffff80162d016c
+NvmeHookSymInitializeController = 0xffffff80162c290c
+NvmeHookTotal                   = seen=2; dsm=2        (Stage A: rise together)
+NvmeHookTarget                  = pass-through controller (model=WD_BLACK AN1500; serial=WUBT21431655)
+NvmeHookVptr, NvmeHookProbe, NvmeHookFnProbe, NvmeHookKcStage, NvmeHookInstanceCount
+                                = resolution diagnostics (see §4)
+```
 
-The Mac has only the Command Line Tools, no Xcode. Build happens on the Mac from
-a mirror of the repository:
+Multiple cold boots done; every boot re-resolves the slide (it changes per
+boot, KASLR is active) and re-arms. No panic, no regression.
 
-| Path on the Mac | What it is |
-|---|---|
-| `~/src/NvmeHook` | mirror of the repo (`NvmeHook/`, `Scripts/`, `MacKernelSDK/`) |
-| `~/src/Lilu` | Lilu 1.7.2 **repository root**; the source dir is `~/src/Lilu/Lilu` |
+The Stage A gate from `PLAN.md` §6 is met: counters move together under real
+discard traffic, the machine is stable. `M2` (blocking on the control device)
+is the next milestone and is not implemented.
+
+## 3. Device facts (from `AGENTS.md`, restated because they decide every judgement)
+
+- Target (faulty, **not attached**): Intel Optane `INTEL SSDPD21K750GAM`, serial
+  `PHKD9344003J750F`, 750 GB. Its firmware drops off the bus on TRIM.
+- Control (healthy, attached): `WD_BLACK AN1500`, serial `WUBT21431655`. It is
+  the only `IONVMeController` currently published on the machine
+  (`NvmeHookInstanceCount = 1`).
+- Everything about a Samsung 990 EVO / "DirectLinkSupport" that may linger in
+  old notes or agent memories is wrong for this project and has been removed
+  from the driver. The identity match is model **and** serial
+  (`isTargetController` in `NvmeHook.cpp`).
+- Note: `IONVMeController` publishes `Model Number` / `Serial Number` but no
+  `Vendor Identifier` (an earlier probe read 0x0). Do not match on vendor.
+
+## 4. The macOS 26 (Tahoe) symbol-resolution design
+
+Read this before changing anything in `workerThread` / `resolveKcSymbols`
+(`NvmeHook.cpp`). Four approaches were tried; three are dead, one works.
+
+Dead ends, all verified on this machine:
+
+1. **Lilu `solveSymbol` does not work on Tahoe at all** — neither for kexts
+   nor for the kernel. Two independent reasons: kernel-collection kext slices
+   are not resolvable by Lilu 1.7.2 (its `kcGetRunningAddresses` looks for a
+   literal `__LINKEDIT` segment; Tahoe marks the shared symbol region
+   `__LINKEDIT_hidden`), and collection-builtin kexts report
+   `kmod_info->address = 0`, so Lilu's kext callback hands the plugin a zero
+   base. Do not "fix" this by parsing kmods or trusting the callback's slide.
+2. **Scanning kernel VM is banned.** A version that walked VM pages to find the
+   outer collection header panicked in the wild (unmapped gap between the base
+   collection and the OpenCore-injected slices). Kernel file reads via
+   `vn_rdwr` return errors instead of faulting — that is the only sanctioned
+   memory access that is not backed by a validated live object.
+3. **`__ZTI16IONVMeController` does not exist** in the collection's symbol
+   table (type-info symbols are stripped); `__ZTV16IONVMeController` does.
+   Any validation built on the type-info symbol cannot work.
+4. **`kextstat`/`kmutil showloaded` report link addresses, not runtime
+   addresses.** Comparing them against runtime pointers misleads; KASLR is
+   active and the slide was measured at 0x13c00000–0x1f600000 (~315–530 MB)
+   across boots. Any sanity bound on the slide below ~1 GB silently rejects
+   every real boot.
+
+The working design (`workerThread`):
+
+1. A worker thread (started from Lilu's `patchersReady` callback) waits for an
+   `IONVMeController` instance via `IOService::waitForMatchingService`. This
+   must stay a **blocking wait on a dedicated kernel thread** — `DEBUG.md`
+   documents that the alternative (an IOKit matching notification registered in
+   `start()`) hangs the machine at boot. Do not reintroduce it.
+2. The instance's first word is its vptr — an address inside IONVMeFamily,
+   whatever the slide is.
+3. The on-disk collection
+   `/System/Library/KernelCollections/BootKernelExtensions.kc` is read with
+   `vn_rdwr` (safe). The IONVMeFamily slice is found through its
+   `LC_FILESET_ENTRY` (cmd `0x80000035`), and the slice's own `LC_SYMTAB`
+   resolves the hook symbols **plus `__ZTV16IONVMeController`** by mangled
+   name. Symbol link values give offsets relative to the slice, which is why
+   the aux collection (OpenCore-injected, different layout) is irrelevant as
+   long as the base kext binary is unchanged.
+4. `slide = vptr - (__ZTV link value + 2 * sizeof(uintptr_t))`. The vptr points
+   at the first virtual function slot; the vtable symbol points two slots
+   earlier, and the vtable lives in `__DATA` — **not** in `__TEXT` (an earlier
+   validation required the vptr itself to be in `__TEXT` and rejected every
+   real boot).
+5. Validation before routing: slide page-aligned and bounded
+   (`< 0x1000000000` — a 256 MB bound was the last bug and rejected every real
+   boot), `vptr - slide` inside the slice's full segment span, and the function
+   pointers stored in the first vtable slots minus slide inside the slice's
+   `__TEXT`. All checks are visible in the registry diagnostics
+   (`NvmeHookProbe`, `NvmeHookFnProbe`, `NvmeHookKcStage`) — keep them when
+   editing.
+6. Only after everything validates does `routeFunction` run. Any failure
+   publishes a status and leaves the system unpatched instead of guessing.
+
+Design constraints from `PLAN.md` §4 that are not implemented yet and must not
+be forgotten: per-device short-circuit in the hook (match on the owning
+instance), bias to over-block, kill-switch boot-arg (`-nvmehookoff` already
+gates loading via Lilu), and the Write Zeroes (0x08) / Format NVM (0x80)
+deallocate audit.
+
+## 5. Known doc debt
+
+- `README.md` "State" still says milestone M0.
+- `DEBUG.md` "Shape of the driver" describes the M0 `chefStart`; the real shape
+  now includes the worker thread, the collection parser and the identity
+  report, and the IORegistry property table has grown (`NvmeHookTarget`,
+  `NvmeHookDevice*`, `NvmeHookCounters`, `NvmeHookTotal`, the resolution
+  diagnostics listed in §2).
+- Both must be brought in line when M2 lands, per `AGENTS.md`: state documents,
+  no round-by-round history, no commit pinning.
+
+## 6. Build, deploy, verify
+
+Build (on the Mac, in `~/src/NvmeHook`, after syncing the two files from the
+repo):
 
 ```sh
-ssh ling@192.168.50.204 'cd ~/src/NvmeHook && sh Scripts/build-noxcode.sh'
+sh Scripts/build-noxcode.sh
+# binary: build/noxcode.*/NvmeHook.kext/Contents/MacOS/NvmeHook
 ```
 
-The newest kext path is written to `build/latest-noxcode-build.txt`.
+The version lives in `VERSION=` inside `Scripts/build-noxcode.sh` (1.0.0).
+`Info.plist` must stay LF-only or the kext is silently dropped.
 
-Three traps, all already hit:
-
-1. **Lilu's `Headers/hde64.h` is a symlink to `../../hde/hde64.h`.** A tree that
-   keeps only `Lilu/Headers` and `Lilu/Library` will not compile. Keep the
-   repository layout and point the build at `~/src/Lilu/Lilu`.
-2. **Copying files from Windows with `tar` preserves the read-only attribute on
-   directories** (mode 555), which makes `rm -rf` fail with "Permission denied".
-   Run `chmod -R u+rwX` on the extracted tree.
-3. The Mac sometimes cannot reach github.com. Clone on Windows instead, through
-   the proxy in the MCP PowerShell console, then copy the tarball over.
-
-## 6. Deploy
+Deploy (from Windows, all over SSH):
 
 ```sh
-# kext
-sudo cp -R <build>/NvmeHook.kext /Volumes/EFI/EFI/OC/Kexts/
-# config: Kernel > Add gains one entry after Lilu, then
-sudo cp /Volumes/EFI/EFI/OC/config.plist /Volumes/EFI/EFI/OC/config.plist.bak-<reason>-<timestamp>
-plutil -lint /Volumes/EFI/EFI/OC/config.plist
-sync
+scp <built binary> ling@192.168.50.204:~/NvmeHook-new
+ssh ling@192.168.50.204
+sudo diskutil mount disk2s1
+sudo cp ~/NvmeHook-new /Volumes/EFI/EFI/OC/Kexts/NvmeHook.kext/Contents/MacOS/NvmeHook
+sudo diskutil unmount disk2s1
+sudo reboot
 ```
 
-The ESP currently holds the M0 configuration: `NvmeHook.kext` enabled after Lilu,
-and `Misc > Debug > Target = 103` (`0x67`, OpenCore writes its own log file to the
-ESP). Backups of both earlier states sit next to it (`config.plist.bak-nvmehook-*`).
+The `Kernel > Add` entry for `NvmeHook.kext` is present and `Enabled`. To
+disable it (panic recovery), toggle `Enabled` with `python3` + `plistlib`
+against `/Volumes/EFI/EFI/OC/config.plist` — backups exist next to it
+(`config.plist.bak-m1-probe`, `bak-m15-deploy`, `bak-m15-panic`).
 
-**`plutil -extract` writes its result back into the input file when `-o` is
-omitted.** `plutil -extract Kernel.Add json config.plist` replaces the entire
-configuration with the extracted fragment; that happened once and cost a restore
-from backup. Always pass `-o -` to read, `plutil -replace` to edit, or edit with
-Python `plistlib` after backing up. `_scratch/add_oc_entry.py` and
-`_scratch/set_oc_log_target.py` are the safe helpers for the two recurring edits.
-
-Why not `/Library/Extensions`: tried, and it cannot work. `kmutil` builds the
-auxiliary collection from kexts on disk and Lilu is not there, so it fails with
-`Failed to bind '_lilu' as could not find a kext with 'as.vit9696.Lilu' bundle-id`.
-
-Side effect still present: that experiment put `com.ling.NvmeHook` into the
-auxiliary collection's history, so `kernelmanagerd` logs
-`Couldn't load bundle 'com.ling.NvmeHook' from history: ... No bundle at
-/Library/Extensions/NvmeHook.kext` on every boot. Harmless, and it disappears
-after `sudo kmutil install --update-all` or the next macOS update rebuilds the
-collection. Do not "fix" it by putting files back in `/Library/Extensions`.
-
-## 7. State of the work
-
-Milestone **M0 passes**: the plugin loads (`com.ling.NvmeHook 0.1.0` in
-`kextstat`), patches nothing, and reports itself to the IORegistry instead of the
-kernel log:
+Verify after boot:
 
 ```sh
-ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Bus)'
+kextstat | grep -iE 'nvmehook|IONVMeFamily'
+ioreg -lw0 | grep -oE '"NvmeHook[A-Za-z0-9]*" = "[^"]*"' | sort -u
 ```
 
-`NvmeHookBus` currently reads `0 controller(s) visible at plugin start`. That is
-correct rather than a fault: the injected kext loads before `IONVMeFamily`
-publishes its controllers, so the scan in the plugin start callback sees none.
-`DEBUG.md` holds the property table, the reasoning and the reading commands.
+`kextstat` shows the **link** address; `NvmeHookKextBase` shows the runtime
+base. Sanity check: `NvmeHookSymDoUnmap - NvmeHookKextBase` must equal `0x13396`
+(the link offset of doUnmap in the 25G332 collection — the same offset the old
+hard-coded driver used; the new driver re-derives it from the symbol table on
+every boot instead).
 
-Two things were established the hard way, both recorded in `DEBUG.md`:
+## 7. Panic recovery (proven, keep within reach)
 
-- Kernel logging is unusable as evidence here. The ring buffer is overwritten by
-  boot traffic within about 40 seconds and the early messages never reach the
-  unified log, so neither `dmesg` nor `log show` shows the plugin at all. Hence
-  the IORegistry report.
-- A first attempt published the report from a custom `IOService` subclass
-  (`LILU_CUSTOM_IOKIT_INIT`) that registered a `gIOFirstMatchNotification` for
-  `IONVMeController` inside `start()`. It hangs the machine during boot: the
-  OpenCore picker stays reachable, macOS never reaches the desktop, the machine
-  restarts, and the cycle repeats with no `Kernel-*.panic` written. That design
-  is gone; do not reintroduce it.
+A panicking boot loops as long as the ESP entry is enabled, so recovery is a
+routine, not an emergency:
 
-## 8. Immediate next step
+1. Power off: on the KVM host `root@192.168.50.155`,
+   `echo 1 > /sys/class/gpio/gpio503/value; sleep 6; echo 0 > ...`, then check
+   that `gpio504` reads `1` (LED off). gpio503 is the power button (1 =
+   pressed), gpio504 the LED (0 = machine on).
+2. Power on with F11 held through POST:
+   `nohup python3 /root/nanokvm-boot-helper.py --stop /tmp/<fresh>.stop > /tmp/log 2>&1 &`.
+   Early `write /dev/hidg0: i/o timeout` lines are normal.
+3. When the MSI boot menu appears: `touch` the stop marker, wait ~5 s. Menu
+   rules: pressing Enter while no grey bar is visible boots the orange
+   (last-boot) entry; pressing a direction key makes the grey bar appear; the
+   grey bar is the selection. Target entry: `KingstonDataTraveler ...
+   Partition 1` (GRUB → Debian rescue). The rescue machine's IP is printed on
+   its tty1 banner — confirm it there instead of trusting notes.
+4. In the rescue environment: `sudo mount /dev/sda1 /mnt/esp`, then
+   `sudo python3 /tmp/oc_disable_kext.py /mnt/esp/EFI/OC/config.plist
+   NvmeHook.kext off` (re-upload the script if `/tmp` is empty), `sync`,
+   unmount, reboot back into macOS.
+5. Panic evidence, from the running system afterwards:
+   `/Library/Logs/DiagnosticReports/Kernel-*.panic` and
+   `sudo nvram aapl,panic-info`. An early panic may leave neither.
 
-M1 is written but **not armed**. The counters, the two hooks and the prologue
-verification are in `NvmeHook.cpp`; the driver refuses to patch because it cannot
-address the two functions at runtime, and it says so:
+NanoKVM screenshots lag one frame: after any keypress take a second screenshot
+before concluding anything. If remote control returns "preempted by manual
+input", the web UI holds manual control — stop and ask.
 
-```
-"NvmeHookHooks" = "prologue mismatch, nothing patched"
-```
+## 8. Next milestone: M2 (blocking on the control device)
 
-What is established (detail and evidence in `DEBUG.md`):
+Implementation sketch, per `PLAN.md` §3–§5:
 
-- Targets are `IONVMeBlockStorageDevice::doUnmap` (`seen`) and
-  `::doUnmapNVMe` (`dsm`), at link-time `0xffffff80026d0396` and
-  `0xffffff80026d016c` in the installed boot collection, with their prologues
-  recorded and verified byte-for-byte.
-- The kext image mapped at runtime keeps only header and data (0x19000 bytes,
-  no code); the code lives in the kernel's executable region, and neither the
-  on-disk image offsets nor `_kmod`-derived slides point at it.
-- `solveSymbol` returns 0 for these symbols through both the kext id and
-  `KernelID`, although `_kmod` resolves through `KernelID`.
-
-Next, in order: try `updateRunningInfo(id, slide, size, true)` before solving
-symbols; otherwise hook the `IONVMeBlockStorageDevice` vtable instead of patching
-code. Do not scan kernel space to guess an address — two page-fault panics came
-from exactly that, both inside the plugin's own kext-load callback.
-
-`PLAN.md` sections 3, 5 and 6 still define the acceptance gates; stage A and B on
-the control device come before the Optane is ever mounted.
-
-## 9. Things that will cost time if rediscovered
-
-- **Reboots are the deploy loop.** Batch changes; there is no way to load a
-  Lilu plugin on this machine without OpenCore injection.
-- Mounting the ESP is per boot: `sudo diskutil mount disk2s1`. USB EFI, if ever
-  needed for reading only, is `sudo diskutil mount readOnly disk4s1` and must
-  not be written.
-- `kextload`/`kextutil` are shims over `kmutil` here and cannot install a plugin
-  that depends on Lilu; do not spend time on them.
-- A kext copied out of a user home fails validation on ownership (501:20 vs 0:0);
-  irrelevant now that deploy goes to the ESP, where FAT stores no ownership.
-- macOS on this machine sometimes stalls on restart and leaves
-  `Library/Logs/DiagnosticReports/shutdown_stall_*.shutdownStall`; that is not a
-  driver panic and does not by itself indicate a bad deploy.
-- **Boot-loop recovery**: press and hold F11 from before POST until the MSI boot
-  menu appears, choose the Kingston USB, and in the Debian rescue system mount
-  `/dev/sda1` (the internal ESP), set `Enabled = false` for `NvmeHook.kext` in
-  `EFI/OC/config.plist` after backing it up, `sync`, unmount, reboot. The macOS
-  volume there is `/dev/sda3`; `sudo apfs-mount /dev/sda3 /mnt/mac` mounts it
-  read-only for evidence such as panic reports. Rescue SSH is
-  `rescue@192.168.50.204` with `MSI_X570/installer_media_creation/debian-rescue/rescue-known_hosts`.
-- NanoKVM can be driven over SSH without the web UI:
-  `MSI_X570/tools/ssh/kvm-screenshot.py` (screenshot) and the same MCP endpoint
-  for `cube_press_keys` / `cube_type_text`. Screenshots may lag a frame; take a
-  second one before acting on what it shows.
-- Before any change that carries a panic risk, confirm the NanoKVM channel works
-  (hostname `kvm-2c33`, `hw=pcie`, `mode=mcp`) — it is the only way back if the
-  machine stops booting.
-- Serial console debugging is off by default on this machine and is expensive
-  when on; turn it on only for the acceptance run, and off immediately after.
+- In `doUnmapNVMeHook`: if the owning instance matches the configured identity,
+  return success **without** calling the original — the DSM command is never
+  built. Everything else calls the trampoline unchanged.
+- `doUnmapHook` counts `seen` and `blocked`; `dsm` keeps counting at the
+  current instrumentation point. Stage A gate: `dsm` rises with `seen`
+  (already proven). Stage B gate: `blocked == seen`, `dsm` flat.
+- For Stage B the matched identity is temporarily the **control device's**
+  serial (`WUBT21431655`); the real target identity
+  (`INTEL SSDPD21K750GAM` / `PHKD9344003J750F`) goes in only for Stage C/D.
+  Make the identity a single obvious constant (or a boot-arg override), never
+  a scattered string compare.
+- The owning instance for a discard is the `IONVMeBlockStorageDevice`
+  (`self` in the hook); its controller is reachable the same way
+  `IONVMeFamily` reaches it, or the identity can be cached per instance in the
+  existing `Counters` table keyed on `self` — the registry identity is already
+  read once there (`NvmeHookDevice*`).
+- Respect the plan's bias to over-block: no range heuristics, no "only large
+  requests". The kill switch (`-nvmehookoff`) must keep working; consider a
+  second boot-arg that gates only the blocking stage.
+- Afterwards: update `README.md`/`DEBUG.md` (§5) and only then move to
+  Stage C (bare target attach) and Stage D (acceptance) — the gates and the
+  serial-logging requirement are in `PLAN.md` §6.
