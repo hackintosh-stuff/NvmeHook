@@ -8,6 +8,5 @@ __pycache__/
 /_scratch/
 /latest-*-build.txt
 *.kext/
-MacKernelSDK/
 /reference/
 /fixtures/
