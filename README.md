@@ -28,9 +28,8 @@ then on the target itself: the Optane was erased to a single APFS volume and put
 through an hour of write/read-back/delete cycles, three unmount/remount cycles
 and a sleep/wake, with `blocked == seen` and `dsm` at zero throughout — 394
 discards swallowed, none reaching the hardware — and `diskutil verifyVolume`
-clean at the end. `HANDOFF.md` carries the state of the deployed build and the
-operational procedures; `DEBUG.md` carries the implementation, the property table
-and the way the hooks are resolved.
+clean at the end. `DEBUG.md` carries the implementation, the property table and
+the way the hooks are resolved.
 
 The hooks are found from a live `IONVMeController` and fingerprinted before use,
 so the driver never reads the file system and a build whose code does not match
