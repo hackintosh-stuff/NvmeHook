@@ -170,55 +170,68 @@ is affected.
 
 ## IORegistry properties
 
-Published on `IOResources` unless stated otherwise:
+Published on `IOResources` unless stated otherwise. The `NvmeHookDebug` boolean
+in `Info.plist` (absent means false) decides whether the diagnostic half exists
+at all: every one of those is a registry write, and they only matter while the
+driver is being watched.
+
+Always published:
 
 | Property | Meaning |
 |---|---|
 | `NvmeHookVersion` | `MODULE_VERSION` from `Scripts/build-noxcode.sh` |
 | `NvmeHookPatches` | `discard suppression for the configured devices, anchor-resolved (M2)` |
-| `NvmeHookConfig` | the rule list as read from `Info.plist`: `state=ok; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*`, or the reason it could not be read |
+| `NvmeHookConfig` | the rule list as read from `Info.plist`: `state=ok; debug=off; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*`, or the reason it could not be read |
+| `NvmeHookHooks` | which of the three hooks routed (`armed by anchor: doUnmap + counters + InitializeController`) |
 | `NvmeHookTotal` | aggregate `seen=…; blocked=…; dsm=…` over all devices, republished on every event |
-| `NvmeHookBus` | result of the plugin-start scan, e.g. `0 controller(s) visible at plugin start` |
-| `NvmeHookWorker` | `started` when the worker thread exists |
-| `NvmeHookDevice<n>` | one per block storage device seen on the request path: `model=…; serial=…; match=[i] model=… serial=…` or `match=none` |
-| `NvmeHookTarget` | on each controller and on `IOResources`: which rule matched (`matched rule [i] …`) or `pass-through controller …` |
-| `NvmeHookController<n>` | written during the plugin-start scan if a controller is already published |
-| `NvmeHookCounters` | **on the block storage device itself**: `seen=…; blocked=…; dsm=…`, throttled |
 
-Resolution diagnostics, one set per boot:
+Only with `NvmeHookDebug = true`:
 
 | Property | Meaning |
 |---|---|
+| `NvmeHookBus` | result of the plugin-start scan, e.g. `0 controller(s) visible at plugin start` |
+| `NvmeHookWorker` | `started` when the worker thread exists |
+| `NvmeHookController<n>` | per controller seen during the scan: `model=…; serial=…` |
+| `NvmeHookTarget` | on each controller and on `IOResources`: which rule matched (`matched rule [i] …`) or `pass-through controller …` |
+| `NvmeHookDevice<n>` | one per block storage device seen on the request path: `model=…; serial=…; match=[i] model=… serial=…` or `match=none` |
+| `NvmeHookCounters` | **on the block storage device itself**: `seen=…; blocked=…; dsm=…`, throttled |
 | `NvmeHookInstanceCount` | `IONVMeController` instances found by the worker |
 | `NvmeHookVptr<n>` | first word of instance `<n>` — its vtable pointer |
 | `NvmeHookAnchor` | per instance: the vptr, the three candidates it implies, and `fingerprint=match` / `mismatch` / `skipped (foreign image)` |
 | `NvmeHookVptr` | the vptr that became the anchor |
 | `NvmeHookSymDoUnmap` / `…NVMe` / `…InitializeController` | runtime addresses of the three hooks, derived from the anchor |
-| `NvmeHookHooks` | which of the three hooks routed |
 
-Setting properties on `IOResources` also appends their names to the
-`IOResourceMatched` array, because that array is how IOResources advertises what
-it can match. This is expected, not a leak.
+Two `IOResourceMatched` entries come from `Info.plist` itself rather than from
+the driver: `NvmeHookDevices` and `NvmeHookDebug` are personality keys, and IOKit
+exposes every such key on the service it creates. They are not written by the
+driver and cannot be suppressed from inside it.
 
 ## Reading the report
 
 ```sh
 kextstat | grep -iE 'nvmehook|IONVMeFamily'
-ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Config|Hooks|Total|Anchor)'
-ioreg -r -c IONVMeBlockStorageDevice -l -w0 | grep -E 'NvmeHookCounters'
+ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Config|Hooks|Total)' -A 1
+```
+
+With `NvmeHookDebug = true` the rest is there too, including the per-device
+report:
+
+```sh
+ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Anchor|Bus|Worker|Device|Target|Vptr|Sym)'
+ioreg -r -c IONVMeBlockStorageDevice -l -w0 | grep NvmeHookCounters
 ```
 
 `ioreg -n IOResources` prints a large blob; the grep is required, not optional.
 
-`NvmeHookConfig` must read `state=ok; identities=…` with the rules that were
-intended: if it says the key is missing, the `Info.plist` edit did not reach the
-injected bundle, and nothing will be blocked.
+`NvmeHookConfig` must read `state=ok; debug=…; identities=…` with the rules that
+were intended: if it says the key is missing, the `Info.plist` edit did not reach
+the injected bundle, and nothing will be blocked.
 
 The gate the counters are read against: `seen` rises, `blocked` equals `seen`,
 `dsm` stays at zero. (`dsm` rising together with `seen` means the device is not
 matched at all — check `NvmeHookDevice<n>`.)
 
-`NvmeHookAnchor` must read `fingerprint=match`, and
+With `NvmeHookDebug` on, `NvmeHookAnchor` must read `fingerprint=match`, and
 `NvmeHookVptr - NvmeHookSymDoUnmap` must be `0x1AC8A`. Both are independent of
 the slide, so they catch a wrong anchor even when the addresses look plausible.
 

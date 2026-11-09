@@ -1,6 +1,6 @@
 # NvmeHook — handoff notes
 
-Date: 2026-11-10. Driver version: 1.3.0 (deployed on the target machine). Read
+Date: 2026-11-10. Driver version: 1.4.0 (deployed on the target machine). Read
 `PLAN.md` (what and why), `AGENTS.md` (repo conventions and test device rules)
 and `DEBUG.md` (driver shape, IORegistry report, debugging) before touching
 anything. This file carries what those three do not: the state of the deployed
@@ -21,7 +21,7 @@ ling@192.168.50.204` (key auth, no password). sudo on that box is passwordless.
 The Debian rescue system answers on the same address with a different host key;
 reach it with `-o "HostKeyAlias=oc-rescue-usb"` and the rescue `known_hosts`.
 
-The deployed binary is built from the repo sources at version 1.3.0. `README.md`
+The deployed binary is built from the repo sources at version 1.4.0. `README.md`
 and `DEBUG.md` describe the current driver; see §5.
 
 The suppressed devices are **not** in the source: they are listed in the kext's
@@ -33,14 +33,14 @@ the Lilu-level switch that prevents loading.
 
 ## 2. What is deployed and what is verified
 
-Deployed: **1.3.0**, anchor-resolved (§4), with the rules read from `Info.plist`.
+Deployed: **1.4.0**, anchor-resolved (§4), with the rules read from `Info.plist`.
 It suppresses discards for every device matching a rule and counts everything.
 The target is the only NVMe controller present:
 
 ```
-NvmeHookVersion   = 1.3.0
+NvmeHookVersion   = 1.4.0
 NvmeHookPatches   = discard suppression for the configured devices, anchor-resolved (M2)
-NvmeHookConfig    = state=ok; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*
+NvmeHookConfig    = state=ok; debug=on; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*
 NvmeHookHooks     = armed by anchor: doUnmap + counters + InitializeController
 NvmeHookAnchor    = i=0 vptr=0xffffff801baeb020 doUnmap=0xffffff801bad0396
                     doUnmapNVMe=0xffffff801bad016c init=0xffffff801bac290c fingerprint=match
@@ -48,6 +48,12 @@ NvmeHookDevice0   = model=INTEL SSDPD21K750GAM; serial=PHKD9344003J750F;
                     match=[0] model=INTEL SSDPD21K750GAM serial=*
 NvmeHookTotal     = seen=6; blocked=6; dsm=0
 ```
+
+That dump was taken with `NvmeHookDebug` on, which is the only way the anchor,
+the resolved addresses and the per-device/per-controller lines appear at all;
+the addresses are from one boot and move with the slide. With the switch off —
+the shipped default — only `NvmeHookVersion`, `NvmeHookPatches`,
+`NvmeHookConfig`, `NvmeHookHooks` and `NvmeHookTotal` are published.
 
 Stages, in the order they were run:
 
@@ -296,8 +302,9 @@ What is left is upkeep rather than testing:
 
 1. `kDelta*` / `kFingerprint*` are tied to 25G332. After any IONVMeFamily update,
    re-measure them (§4) and confirm `NvmeHookAnchor` still reads
-   `fingerprint=match`; a mismatch means the driver is inert, not that it is
-   working.
+   `fingerprint=match` — with `NvmeHookDebug` switched on for that boot, since
+   the anchor property does not exist otherwise. A mismatch means the driver is
+   inert, not that it is working.
 2. The shipped rule is `INTEL SSDPD21K750GAM` / `*`, i.e. **model only**: any
    further drive of that model would be suppressed too, healthy or not. Put the
    serial in place of the `*` to pin the one sample, and add dicts to the array

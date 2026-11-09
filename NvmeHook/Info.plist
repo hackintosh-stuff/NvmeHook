@@ -36,6 +36,8 @@
 			<string>IOResources</string>
 			<key>IOResourceMatch</key>
 			<string>IOKit</string>
+			<key>NvmeHookDebug</key>
+			<false/>
 			<key>NvmeHookDevices</key>
 			<array>
 				<dict>

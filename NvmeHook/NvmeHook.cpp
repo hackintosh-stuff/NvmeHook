@@ -55,6 +55,7 @@
 #include <IOKit/storage/IOStorage.h>
 #include <kern/thread.h>
 #include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
@@ -86,6 +87,16 @@ static constexpr uint32_t kModelLength = 64;
 static constexpr uint32_t kSerialLength = 32;
 static constexpr char kDevicesKey[] = "NvmeHookDevices";
 
+// Diagnostic properties are opt-in, because every one of them is a registry
+// write and most of them only matter while the driver is being developed:
+//
+//   <key>NvmeHookDebug</key> <false/>
+//
+// Absent means false. What is always published is the minimum needed to know
+// what the driver is doing: NvmeHookVersion, NvmeHookPatches, NvmeHookConfig,
+// NvmeHookHooks and the counters in NvmeHookTotal.
+static constexpr char kDebugKey[] = "NvmeHookDebug";
+
 struct DeviceIdentity {
 	char model[kModelLength];
 	char serial[kSerialLength];
@@ -94,7 +105,11 @@ struct DeviceIdentity {
 static DeviceIdentity identities[kMaxIdentities] {};
 static uint32_t identityCount {0};
 static bool configLoaded {false};
+static bool debugOutput {false};
 static const char *configState = "not read yet";
+static const char *workerState = "not started";
+
+static void reportBus();
 
 // Properties IONVMeFamily publishes on each controller.
 static const char *keyModel = "Model Number";
@@ -175,6 +190,17 @@ static void publishAddress(const char *key, mach_vm_address_t address) {
 	publishStatus(key, value);
 }
 
+// Diagnostics go through these: nothing is written unless NvmeHookDebug is set.
+static void publishDebug(const char *key, const char *value) {
+	if (debugOutput)
+		publishStatus(key, value);
+}
+
+static void publishDebugAddress(const char *key, mach_vm_address_t address) {
+	if (debugOutput)
+		publishAddress(key, address);
+}
+
 // The block storage device keeps its identity in a "Device Characteristics"
 // dictionary; controllers publish the same pair as flat properties. The block
 // device is what the hook actually receives, so its own copy is the one the
@@ -231,7 +257,8 @@ static void appendTo(char *buffer, size_t size, const char *text) {
 
 static void publishConfig() {
 	char report[480];
-	snprintf(report, sizeof(report), "state=%s; identities=%u", configState, identityCount);
+	snprintf(report, sizeof(report), "state=%s; debug=%s; identities=%u", configState,
+			 debugOutput ? "on" : "off", identityCount);
 	for (uint32_t i = 0; i < identityCount; i++) {
 		char entry[128];
 		snprintf(entry, sizeof(entry), "; [%u] model=%s serial=%s",
@@ -241,10 +268,11 @@ static void publishConfig() {
 	publishStatus("NvmeHookConfig", report);
 }
 
-// Read the device list from the plugin's own personality once. The instance may
-// not exist yet when the first discard arrives, in which case the identity stays
-// unresolved and is retried on the next event: the rules are never guessed.
-static void loadIdentities() {
+// Read the device list and the diagnostics switch from the plugin's own
+// personality once. The instance may not exist yet when the first discard
+// arrives, in which case nothing is decided and the read is retried on the next
+// event: the rules are never guessed.
+static void loadConfiguration() {
 	if (configLoaded)
 		return;
 
@@ -255,30 +283,39 @@ static void loadIdentities() {
 	}
 
 	configLoaded = true;
+	if (auto flag = OSDynamicCast(OSBoolean, instance->getProperty(kDebugKey)))
+		debugOutput = flag->getValue();
+
 	auto array = OSDynamicCast(OSArray, instance->getProperty(kDevicesKey));
 	if (array == nullptr) {
 		configState = "NvmeHookDevices missing from Info.plist";
-		publishConfig();
-		return;
+	} else {
+		uint32_t entries = array->getCount();
+		for (uint32_t i = 0; i < entries && identityCount < kMaxIdentities; i++) {
+			auto entry = OSDynamicCast(OSDictionary, array->getObject(i));
+			if (entry == nullptr)
+				continue;
+			auto model = OSDynamicCast(OSString, entry->getObject("Model"));
+			auto serial = OSDynamicCast(OSString, entry->getObject("Serial"));
+			if (model == nullptr || serial == nullptr)
+				continue;
+			strlcpy(identities[identityCount].model, model->getCStringNoCopy(), kModelLength);
+			strlcpy(identities[identityCount].serial, serial->getCStringNoCopy(), kSerialLength);
+			identityCount++;
+		}
+		configState = identityCount != 0 ? "ok" : "no usable entry in NvmeHookDevices";
 	}
 
-	uint32_t entries = array->getCount();
-	for (uint32_t i = 0; i < entries && identityCount < kMaxIdentities; i++) {
-		auto entry = OSDynamicCast(OSDictionary, array->getObject(i));
-		if (entry == nullptr)
-			continue;
-		auto model = OSDynamicCast(OSString, entry->getObject("Model"));
-		auto serial = OSDynamicCast(OSString, entry->getObject("Serial"));
-		if (model == nullptr || serial == nullptr)
-			continue;
-		strlcpy(identities[identityCount].model, model->getCStringNoCopy(), kModelLength);
-		strlcpy(identities[identityCount].serial, serial->getCStringNoCopy(), kSerialLength);
-		identityCount++;
-	}
-
-	configState = identityCount != 0 ? "ok" : "no usable entry in NvmeHookDevices";
 	publishConfig();
-	SYSLOG("nvmehook", "config: %s, %u identity(ies) from Info.plist", configState, identityCount);
+	SYSLOG("nvmehook", "config: %s, %u identity(ies), debug %s", configState, identityCount,
+		   debugOutput ? "on" : "off");
+
+	// The diagnostics that were produced before the switch was known are
+	// published now, once, if it is on.
+	if (debugOutput) {
+		publishStatus("NvmeHookWorker", workerState);
+		reportBus();
+	}
 }
 
 static Counters *countersFor(IOService *device) {
@@ -311,7 +348,7 @@ static Counters *countersFor(IOService *device) {
 // on the first call; if it is not, the decision stays open and is retried on
 // the next event instead of being guessed.
 static void resolveIdentity(Counters *c) {
-	loadIdentities();
+	loadConfiguration();
 	if (!configLoaded)
 		return;
 
@@ -332,7 +369,7 @@ static void resolveIdentity(Counters *c) {
 				 identities[c->identityIndex].model, identities[c->identityIndex].serial);
 	else
 		snprintf(value, sizeof(value), "model=%s; serial=%s; match=none", model, serial);
-	publishStatus(key, value);
+	publishDebug(key, value);
 	SYSLOG("nvmehook", "device %u: %s", c->index, value);
 }
 
@@ -346,7 +383,8 @@ static void publishCounters(Counters *c) {
 	char value[128];
 	snprintf(value, sizeof(value), "seen=%llu; blocked=%llu; dsm=%llu",
 			 c->seen, c->blocked, c->dsm);
-	c->device->setProperty("NvmeHookCounters", value);
+	if (debugOutput)
+		c->device->setProperty("NvmeHookCounters", value);
 }
 
 static void publishTotal() {
@@ -418,7 +456,7 @@ static IOReturn doUnmapNVMeHook(void *self, void *request, IOBlockStorageDeviceE
 static void reportControllerIdentity(IOService *controller) {
 	const char *model = stringProperty(controller, keyModel);
 	const char *serial = stringProperty(controller, keySerial);
-	loadIdentities();
+	loadConfiguration();
 	int32_t matched = configLoaded ? matchIdentity(model, serial) : -1;
 
 	char report[320];
@@ -431,8 +469,9 @@ static void reportControllerIdentity(IOService *controller) {
 				 "pass-through controller (model=%s; serial=%s)", model, serial);
 	}
 
-	controller->setProperty("NvmeHookTarget", report);
-	publishStatus("NvmeHookTarget", report);
+	if (debugOutput)
+		controller->setProperty("NvmeHookTarget", report);
+	publishDebug("NvmeHookTarget", report);
 	SYSLOG("nvmehook", "identity: %s", report);
 }
 
@@ -496,14 +535,19 @@ static void workerThread(void *, wait_result_t) {
 		return;
 	}
 
+	// The plugin's own service exists by now in practice, so this is where the
+	// diagnostics switch usually becomes known; if it is on, the bus report that
+	// was skipped at load time is published from here.
+	loadConfiguration();
+
 	for (uint32_t i = 0; i < instanceCount; i++) {
 		char key[32];
 		snprintf(key, sizeof(key), "NvmeHookVptr%u", i);
-		publishAddress(key, *reinterpret_cast<uintptr_t *>(instances[i]));
+		publishDebugAddress(key, *reinterpret_cast<uintptr_t *>(instances[i]));
 	}
 	char count[16];
 	snprintf(count, sizeof(count), "%u", instanceCount);
-	publishStatus("NvmeHookInstanceCount", count);
+	publishDebug("NvmeHookInstanceCount", count);
 
 	// The identity report covers every controller: the matched device may sit
 	// behind any of them, and the registry publishes model and serial per
@@ -555,7 +599,7 @@ static void workerThread(void *, wait_result_t) {
 				 static_cast<unsigned long long>(candidateDoUnmapNVMe),
 				 static_cast<unsigned long long>(candidateInitializeController),
 				 !near ? "skipped (foreign image)" : (matched ? "match" : "mismatch"));
-		publishStatus("NvmeHookAnchor", probe);
+		publishDebug("NvmeHookAnchor", probe);
 
 		if (!matched)
 			continue;
@@ -572,10 +616,10 @@ static void workerThread(void *, wait_result_t) {
 	}
 
 	{
-		publishAddress("NvmeHookVptr", anchor);
-		publishAddress("NvmeHookSymDoUnmap", addressDoUnmap);
-		publishAddress("NvmeHookSymDoUnmapNVMe", addressDoUnmapNVMe);
-		publishAddress("NvmeHookSymInitializeController", addressInitializeController);
+		publishDebugAddress("NvmeHookVptr", anchor);
+		publishDebugAddress("NvmeHookSymDoUnmap", addressDoUnmap);
+		publishDebugAddress("NvmeHookSymDoUnmapNVMe", addressDoUnmapNVMe);
+		publishDebugAddress("NvmeHookSymInitializeController", addressInitializeController);
 
 		orgDoUnmap = gPatcher->routeFunction(addressDoUnmap,
 											 reinterpret_cast<mach_vm_address_t>(doUnmapHook), true);
@@ -612,7 +656,7 @@ static void reportBus() {
 
 	auto matching = IOService::serviceMatching("IONVMeController");
 	if (matching == nullptr) {
-		publishStatus("NvmeHookBus", "cannot build a matching dictionary");
+		publishDebug("NvmeHookBus", "cannot build a matching dictionary");
 		return;
 	}
 
@@ -625,7 +669,8 @@ static void reportBus() {
 			snprintf(report, sizeof(report), "model=%s; serial=%s",
 					 stringProperty(service, keyModel), stringProperty(service, keySerial));
 
-			service->setProperty(key, report);
+			if (debugOutput)
+				service->setProperty(key, report);
 			SYSLOG("nvmehook", "controller %u: %s", index, report);
 			index++;
 		}
@@ -636,7 +681,7 @@ static void reportBus() {
 
 	char status[96];
 	snprintf(status, sizeof(status), "%u controller(s) visible at plugin start", index);
-	publishStatus("NvmeHookBus", status);
+	publishDebug("NvmeHookBus", status);
 }
 
 // Lilu hands its patcher over here once kernel patching is possible; from this
@@ -647,10 +692,11 @@ static void patchersReady(void *, KernelPatcher &patcher) {
 	thread_t thread = nullptr;
 	if (kernel_thread_start(reinterpret_cast<thread_continue_t>(workerThread), nullptr, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
-		publishStatus("NvmeHookWorker", "started");
+		workerState = "started";
 	} else {
-		publishStatus("NvmeHookWorker", "failed to start");
+		workerState = "failed to start";
 	}
+	publishDebug("NvmeHookWorker", workerState);
 }
 
 static void chefStart() {
@@ -658,12 +704,10 @@ static void chefStart() {
 	publishStatus("NvmeHookPatches", "discard suppression for the configured devices, anchor-resolved (M2)");
 	publishStatus("NvmeHookTotal", "seen=0; blocked=0; dsm=0");
 
-	// The list usually is not readable yet (the plugin's IOService has not been
-	// instantiated when the kext starts); whoever reads it later publishes it.
-	loadIdentities();
-	publishConfig();
-
-	reportBus();
+	// The rules usually are not readable yet (the plugin's IOService has not been
+	// instantiated when the kext starts); whoever reads them later publishes the
+	// configuration, and the diagnostics if NvmeHookDebug asks for them.
+	loadConfiguration();
 	lilu.onPatcherLoad(patchersReady);
 
 	SYSLOG("nvmehook", "%s %s loaded; %u identity(ies) configured", xStringify(PRODUCT_NAME),

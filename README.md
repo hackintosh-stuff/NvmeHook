@@ -63,6 +63,20 @@ boot argument that changes matching: loading the plugin means its rules apply.
 - Edit the list on the ESP copy of `NvmeHook.kext` and reboot; OpenCore injects
   the bundle, so a change needs a restart.
 
+### Diagnostics
+
+`NvmeHookDebug` in the same dictionary decides how much the driver writes to the
+IORegistry. It is `false` by default, and absent means `false`.
+
+| value | what is published |
+|---|---|
+| `false` | `NvmeHookVersion`, `NvmeHookPatches`, `NvmeHookConfig`, `NvmeHookHooks`, `NvmeHookTotal` |
+| `true` | the above plus the anchor and resolved hook addresses, the instance count, the bus scan, the worker state, the per-controller match report and the per-device match report with its own counter |
+
+Diagnostic properties cost a registry write each, which is why they are opt-in;
+the counters in `NvmeHookTotal` are always published because they are the proof
+that suppression works. Changing the switch needs a reboot, like the rule list.
+
 | boot-arg | effect |
 |---|---|
 | `-nvmehookoff` | do not load the plugin at all (checked by Lilu) |
