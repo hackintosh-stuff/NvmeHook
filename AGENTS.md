@@ -24,3 +24,31 @@ not what happened round by round.
   version only. Do not write `at commit <hash>` or round-specific report
   filenames into the body or the sources: the hash goes stale immediately, and
   the round names turn a state document back into a log.
+
+## Deployment: the ESP and nothing else
+
+Lilu and this plugin are installed on the ESP only. Neither is ever written to
+`/Library/Extensions` or any other system volume, however much shorter the load
+path would be — a Lilu plugin kept on the system volume is not an option here.
+
+- The active ESP is the **internal SATA disk's** EFI partition. Confirm it before
+  writing: `diskutil info` shows `Device Location: Internal` for the whole disk.
+- Never write OpenCore files to a USB disk's EFI. The USB sticks in this machine
+  are install and rescue media, not boot configuration.
+- The plugin is injected from `EFI/OC/Kexts` through a `Kernel > Add` entry placed
+  after `Lilu.kext`. Back up `config.plist` next to itself before editing,
+  `plutil -lint` the result, and verify that the only difference from the backup
+  is the entry that was added.
+
+## Test devices: only the named sample is faulty
+
+Only the 750 GB Optane (`INTEL SSDPD21K750GAM`, serial `PHKD9344003J750F`) is
+known to lose its firmware on TRIM. Do not extend that suspicion to other
+hardware in the machine:
+
+- The 32 GB array (`WD_BLACK AN1500`, two 16 GB Optane M10 modules in a set) is
+  healthy: formatted APFS, read and written normally, TRIM enabled, no fault. It
+  is the control device for testing, not a suspect.
+- A failure of the driver on a healthy device is a driver defect. A failure of the
+  target sample under any driver is a property of that sample.
+
