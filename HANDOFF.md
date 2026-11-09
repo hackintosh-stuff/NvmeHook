@@ -160,16 +160,33 @@ Two things were established the hard way, both recorded in `DEBUG.md`:
 
 ## 8. Immediate next step
 
-M1: find the exact `IONVMeFamily` entry point that turns a storage discard into a
-Dataset Management command, and instrument it with counters only.
+M1 is written but **not armed**. The counters, the two hooks and the prologue
+verification are in `NvmeHook.cpp`; the driver refuses to patch because it cannot
+address the two functions at runtime, and it says so:
 
-- `PLAN.md` sections 3, 5 and 6 define the acceptance gates. Do not skip stage A
-  or B on the control device before the Optane is ever mounted.
-- The per-controller identity report that M0 cannot produce belongs here: hook
-  `IONVMeController::start` through Lilu's routing and publish model and serial
-  from the hooked call, where the controller provably exists.
-- Publish counters the same way, as IORegistry properties on the controller or on
-  `IOResources`. Keep the kernel log out of the loop.
+```
+"NvmeHookHooks" = "prologue mismatch, nothing patched"
+```
+
+What is established (detail and evidence in `DEBUG.md`):
+
+- Targets are `IONVMeBlockStorageDevice::doUnmap` (`seen`) and
+  `::doUnmapNVMe` (`dsm`), at link-time `0xffffff80026d0396` and
+  `0xffffff80026d016c` in the installed boot collection, with their prologues
+  recorded and verified byte-for-byte.
+- The kext image mapped at runtime keeps only header and data (0x19000 bytes,
+  no code); the code lives in the kernel's executable region, and neither the
+  on-disk image offsets nor `_kmod`-derived slides point at it.
+- `solveSymbol` returns 0 for these symbols through both the kext id and
+  `KernelID`, although `_kmod` resolves through `KernelID`.
+
+Next, in order: try `updateRunningInfo(id, slide, size, true)` before solving
+symbols; otherwise hook the `IONVMeBlockStorageDevice` vtable instead of patching
+code. Do not scan kernel space to guess an address — two page-fault panics came
+from exactly that, both inside the plugin's own kext-load callback.
+
+`PLAN.md` sections 3, 5 and 6 still define the acceptance gates; stage A and B on
+the control device come before the Optane is ever mounted.
 
 ## 9. Things that will cost time if rediscovered
 

@@ -105,3 +105,97 @@ If the machine stops reaching the desktop after a deploy:
 `_scratch/` in the Windows working copy holds the Lilu clone, config copies and
 the helper scripts used to add the `Kernel > Add` entry and to set
 `Misc > Debug > Target`.
+
+## M1: locating the discard entry points
+
+Targets, from the boot kernel collection:
+
+```
+IONVMeBlockStorageDevice::doUnmap       storage-layer discard entry   (`seen`)
+IONVMeBlockStorageDevice::doUnmapNVMe   builds the NVMe DSM command   (`dsm`)
+```
+
+```
+sudo nm -n /System/Library/KernelCollections/BootKernelExtensions.kc \
+  | grep IONVMeBlockStorageDevice | grep -i unmap
+ffffff80026d016c T __ZN24IONVMeBlockStorageDevice11doUnmapNVMeEP16AppleNVMeRequestP26IOBlockStorageDeviceExtentjP17NVMeLBARangeEntry
+ffffff80026d0396 T __ZN24IONVMeBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj
+```
+
+Their prologues, read from that collection, are the two signatures the driver
+verifies before patching anything:
+
+```
+doUnmap     55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 28 89 cb 41 89
+doUnmapNVMe 55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 28 48 89 75 c0
+```
+
+### Why addressing it from the callback does not work directly
+
+The `onKextLoad` callback reports the kext image's address and size, and for this
+kext they are **0xffffff7f…** and **0x19000**: header, `__DATA`, `__DATA_CONST`
+and a shared `__LINKEDIT`, with no code. The image in the kext submap keeps only
+data; the code is placed in the kernel's executable region, and that placement
+does not match the on-disk collection:
+
+- the on-disk image's `__TEXT` is 0x2b000 and the two functions sit at +0x13396
+  and +0x1316c inside it;
+- at runtime those offsets read as zeros, and the whole image is only 0x19000;
+- scanning every segment of the runtime image for the prologues finds nothing.
+
+`KernelPatcher::solveSymbol` does not help here either: the kext's own MachInfo
+carries no symbol table (`solveSymbol(index, …)` returns 0), and the kernel
+symbol table does not hold the kext's symbols (`solveSymbol(KernelID, …)` also
+returns 0), even though `_kmod` resolves fine through that same call. Computing
+the slide from `_kmod` and adding it to the collection's link-time addresses lands
+outside the real code as well, which is why the prologue check rejects it.
+
+The current build therefore stops at "prologue mismatch, nothing patched": the
+counters are written but never armed, and nothing is redirected.
+
+### Next options, in order of preference
+
+1. Make Lilu read the runtime collection: call `updateRunningInfo(id, slide,
+   size, true)` for the kext before solving symbols, so that `solveSymbol(id, …)`
+   operates on the running image rather than the on-disk one.
+2. Hook at the IOKit level instead of in code: find the `IONVMeBlockStorageDevice`
+   instance and replace its vtable entry for `doUnmap`, which needs no code
+   address arithmetic but does need the object to exist.
+3. Locate the code by scanning the kernel's executable region for the prologues,
+   bounded to the region the running collection reports. Only attempt this with a
+   mapped-range source: an unbounded scan of kernel space is exactly what produced
+   the page-fault panics described below.
+
+### Two panics that came out of this, and what they cost
+
+Both were page faults inside the plugin's own kext-load callback, both from
+addressing arithmetic, not from the hooks:
+
+- a slide/absolute mix-up produced `CR2=0xffffff001e12d000`, a non-canonical
+  address derived from a segment `vmaddr` treated as a slide;
+- a `segment_command_64` parse that read `segname` where `vmaddr` belongs (the
+  fields start at `offset + 24`, not `offset + 8`) produced segment ranges that
+  were never mapped.
+
+Neither wrote to kernel memory; the plugin crashed while reading. That is why
+every scan is now bounded by data that comes from the image itself, and why the
+prologue comparison happens before any patch.
+
+## Recovery flow for a boot loop
+
+Given by the user and confirmed on this machine:
+
+1. Start sending repeated F11 presses immediately after the machine starts
+   rebooting and keep them going through POST.
+2. When the MSI boot menu appears, stop F11, press ArrowDown once to move to the
+   Kingston entry (`UEFI: KingstonDataTraveler 3.00000, Partition 1`), press
+   Enter.
+3. Wait for Debian to come up, then `rescue@192.168.50.204` with
+   `MSI_X570/installer_media_creation/debian-rescue/rescue-known_hosts`.
+
+Long key holds repeat in the firmware menus and skip entries; single short
+presses are the reliable choice once a menu is on screen. In the rescue system
+the internal ESP is `/dev/sda1` and the macOS volume `/dev/sda3` (read-only via
+`sudo apfs-mount /dev/sda3 /mnt/mac`); disabling the `Kernel > Add` entry there
+restores a bootable machine. `/tmp` on the rescue medium is RAM and does not
+survive a reboot.
