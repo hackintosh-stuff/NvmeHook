@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+/build*/
+/runs/
+/results/
+/docs/evidence/
+/_scratch/
+/latest-*-build.txt
+*.kext/
+MacKernelSDK/
+/reference/
+/fixtures/
