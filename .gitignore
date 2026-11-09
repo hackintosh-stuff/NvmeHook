@@ -10,3 +10,4 @@ __pycache__/
 *.kext/
 /reference/
 /fixtures/
+/dist/
