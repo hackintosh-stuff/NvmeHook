@@ -31,15 +31,15 @@ policy for healthy devices.
 
 Devices known to this project:
 
-| Role | Model | Serial | Size | Notes |
-|---|---|---|---|---|
-| Target (buggy) | `INTEL SSDPD21K750GAM` | `PHKD9344003J750F` | 750 GB | macOS reports `TRIM Support: Yes`. Not attached during development. |
-| Control (healthy) | `WD_BLACK AN1500` | `WUBT21431655` | 28.67 GB | Two 16 GB Optane M10 modules in a RAID set on the card. Formatted APFS, read and write verified, TRIM enabled, no fault. |
+| Role | Model | Size | Notes |
+|---|---|---|---|
+| Target (buggy) | `INTEL SSDPD21K750GAM` | 750 GB | macOS reports `TRIM Support: Yes`. Its firmware drops off the bus on TRIM. Not attached during development; it is the sample the acceptance stages are run on. |
+| Control (healthy) | any healthy NVMe in the machine | — | Formatted APFS, read and write verified, TRIM enabled, no fault. Used to prove suppression without spending the target sample. |
 
 Only the 750 GB sample is faulty. The control is healthy by direct observation,
 not by assumption: it is formatted, written to, and keeps working with TRIM on.
-Being the same media family makes it a closer control than an arbitrary drive,
-which is why it is the one to use for stages A and B.
+Being the same media family makes for a closer control than an arbitrary drive,
+which is why one was kept in the machine.
 
 ## 3. Where to intercept
 
@@ -199,9 +199,8 @@ written before the soak reads back intact.
 
 ## 10. Open questions
 
-- What is actually inside the `WD_BLACK AN1500`? The volume is named `Optane_32G`,
-  which suggests an Optane module behind the card's RAID controller, i.e. not a
-  plain healthy NVMe. Confirm before treating it as the control device, because
-  a control device that shares the target's flaw proves nothing.
+- Is the control device's media independent of the target's, or does it share the
+  same family? A control that shares the target's flaw proves nothing, so this
+  has to be settled before stage B results are trusted.
 - Is the 750 GB sample removable at will, and is there a second one?
 - Deploy path for iteration: `/Library/Extensions` or OpenCore injection?

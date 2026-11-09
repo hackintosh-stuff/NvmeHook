@@ -4,10 +4,10 @@ A Lilu plugin that keeps NVMe TRIM (Dataset Management / deallocate) away from
 specific devices whose firmware does not survive it, while every other NVMe
 device keeps TRIM unchanged.
 
-Target device: Intel Optane `SSDPD21K750GAM`, serial `PHKD9344003J750F`, 750 GB.
-Its firmware drops off the bus when it receives TRIM and takes the machine with
-it. Only that sample is faulty; the `WD_BLACK AN1500` in the same machine is the
-healthy control device.
+Target device: a 750 GB Intel Optane `SSDPD21K750GAM`. Its firmware drops off the
+bus when it receives TRIM and takes the machine with it. Only that sample is
+faulty; the other NVMe device in the machine is healthy and serves as the
+control.
 
 ## State
 
@@ -56,7 +56,7 @@ boot argument that changes matching: loading the plugin means its rules apply.
 - Several dicts may be listed; they are tried in order and the first match wins.
 - `*` in either field matches any value. The shipped rule pins the model and
   accepts any serial, so every drive of that model is covered; replace the `*`
-  with `PHKD9344003J750F` to pin the single unit instead.
+  with that drive's serial to pin the single unit instead.
 - Matching is on the block storage device the discard belongs to, and the result
   is cached per device.
 - Edit the list on the ESP copy of `NvmeHook.kext` and reboot; OpenCore injects

@@ -42,11 +42,10 @@ path would be — a Lilu plugin kept on the system volume is not an option here.
 
 ## Test devices: only the named sample is faulty
 
-Only the 750 GB Optane (`INTEL SSDPD21K750GAM`, serial `PHKD9344003J750F`) is
-known to lose its firmware on TRIM. Do not extend that suspicion to other
-hardware in the machine:
+Only the 750 GB Optane (`INTEL SSDPD21K750GAM`) is known to lose its firmware on
+TRIM. Do not extend that suspicion to other hardware in the machine:
 
-- The 32 GB array (`WD_BLACK AN1500`, two 16 GB Optane M10 modules in a set) is
+- The second NVMe device in the machine (a 32 GB RAID array on a PCIe card) is
   healthy: formatted APFS, read and written normally, TRIM enabled, no fault. It
   is the control device for testing, not a suspect.
 - A failure of the driver on a healthy device is a driver defect. A failure of the
