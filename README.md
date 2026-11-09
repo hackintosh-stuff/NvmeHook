@@ -11,9 +11,9 @@ healthy control device.
 
 ## State
 
-Milestone M2. Discards are suppressed for the one device whose model and serial
-match the configured identity, at the point where a storage discard would become
-an NVMe Dataset Management command; every other NVMe device reaches the original
+Milestone M2. Discards are suppressed for every device that matches a rule in the
+kext's `Info.plist`, at the point where a storage discard would become an NVMe
+Dataset Management command; every other NVMe device reaches the original
 implementation unchanged, byte for byte.
 
 The suppression is measured, not assumed. Three counters are published per
@@ -38,13 +38,34 @@ makes it inert instead of dangerous.
 
 ## Configuration
 
-Every boot-arg is optional; the defaults act on the target device.
+The devices to suppress are listed in this kext's `Info.plist`, under the
+personality, and nowhere else — there are no device names in the source and no
+boot argument that changes matching: loading the plugin means its rules apply.
+
+```xml
+<key>NvmeHookDevices</key>
+<array>
+    <dict>
+        <key>Model</key>
+        <string>INTEL SSDPD21K750GAM</string>
+        <key>Serial</key>
+        <string>*</string>
+    </dict>
+</array>
+```
+
+- Several dicts may be listed; they are tried in order and the first match wins.
+- `*` in either field matches any value. The shipped rule pins the model and
+  accepts any serial, so every drive of that model is covered; replace the `*`
+  with `PHKD9344003J750F` to pin the single unit instead.
+- Matching is on the block storage device the discard belongs to, and the result
+  is cached per device.
+- Edit the list on the ESP copy of `NvmeHook.kext` and reboot; OpenCore injects
+  the bundle, so a change needs a restart.
 
 | boot-arg | effect |
 |---|---|
 | `-nvmehookoff` | do not load the plugin at all (checked by Lilu) |
-| `-nvmehooknoblock` | arm every hook and keep counting, but pass every request through |
-| `-nvmehookcontrol` | match the healthy control sample (`WD_BLACK AN1500` / `WUBT21431655`) instead of the target |
 | `-nvmehookdbg` | Lilu debug output for this plugin |
 | `-nvmehookbeta` | allow loading on beta kernels |
 

@@ -33,10 +33,10 @@
 //      once per device from the block storage device's own registry properties
 //      and cached in the counters table; unmatched devices, and devices whose
 //      identity is not published yet, pass through untouched.
-//      -nvmehooknoblock arms everything but blocks nothing, and
-//      -nvmehookcontrol matches the healthy control sample instead of the
-//      target, which is what makes suppression provable without the sample
-//      that dies under it.
+//      The rules come from the kext's Info.plist (NvmeHookDevices), so several
+//      model/serial pairs can be suppressed without touching the source, and
+//      "*" is accepted as "any value" in either field. There is no boot-arg
+//      switch any more: loading the plugin means its rules apply.
 //
 //  The report is published to the IORegistry, not the kernel log: the ring
 //  buffer is overwritten by boot traffic within a minute, while registry
@@ -54,6 +54,7 @@
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <IOKit/storage/IOStorage.h>
 #include <kern/thread.h>
+#include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
@@ -63,34 +64,37 @@
 static const char *bootargOff[] = { "-nvmehookoff" };
 static const char *bootargDebug[] = { "-nvmehookdbg" };
 static const char *bootargBeta[] = { "-nvmehookbeta" };
-// Beyond Lilu's own three: -nvmehooknoblock arms the hooks and counts but
-// never short-circuits a request, and -nvmehookcontrol selects the healthy
-// control sample as the matched device instead of the target. Both are read
-// once at plugin start, so no lookup happens on the request path.
-static const char *bootargNoBlock[] = { "-nvmehooknoblock" };
-static const char *bootargControl[] = { "-nvmehookcontrol" };
 
-// The device the block decision matches. Exactly one identity is active; the
-// decision is a single comparison against these strings, never a scattered set
-// of string tests. NVMe model and serial are both required: a model-only match
-// would hit every drive of the same type, including healthy ones.
+// Devices to suppress, defined in this kext's Info.plist under the personality:
+//
+//   <key>NvmeHookDevices</key>
+//   <array>
+//     <dict>
+//       <key>Model</key>  <string>INTEL SSDPD21K750GAM</string>
+//       <key>Serial</key> <string>*</string>
+//     </dict>
+//   </array>
+//
+// IOKit copies personality keys onto the service instance, so the list is read
+// from ADDPR(selfInstance) rather than compiled in. Several entries are allowed;
+// "*" in either field matches any value, which is what makes a model-only rule
+// possible. An entry whose model and serial both match blocks that device; there
+// is no boot argument that changes the behaviour — loading the plugin means the
+// rules apply.
+static constexpr uint32_t kMaxIdentities = 4;
+static constexpr uint32_t kModelLength = 64;
+static constexpr uint32_t kSerialLength = 32;
+static constexpr char kDevicesKey[] = "NvmeHookDevices";
+
 struct DeviceIdentity {
-	const char *role;
-	const char *model;
-	const char *serial;
+	char model[kModelLength];
+	char serial[kSerialLength];
 };
 
-static const DeviceIdentity identityTarget {"target", "INTEL SSDPD21K750GAM", "PHKD9344003J750F"};
-static const DeviceIdentity identityControl {"control", "WD_BLACK AN1500", "WUBT21431655"};
-static const DeviceIdentity *activeIdentity = &identityTarget;
-static bool blockingEnabled = true;
-
-static bool argumentPassed(const char **names, size_t count) {
-	for (size_t i = 0; i < count; i++)
-		if (checkKernelArgument(names[i]))
-			return true;
-	return false;
-}
+static DeviceIdentity identities[kMaxIdentities] {};
+static uint32_t identityCount {0};
+static bool configLoaded {false};
+static const char *configState = "not read yet";
 
 // Properties IONVMeFamily publishes on each controller.
 static const char *keyModel = "Model Number";
@@ -141,7 +145,7 @@ struct Counters {
 	uint64_t dsm {0};
 	uint32_t index {0};
 	bool identityKnown {false};
-	bool matched {false};
+	int32_t identityIndex {-1};
 };
 
 static constexpr uint32_t maxDevices = 8;
@@ -187,20 +191,94 @@ static const char *identityPropertyValue(IOService *service, const char *key, co
 }
 
 // NVMe Identify strings are space padded to a fixed field width and the
-// registry copy may keep that padding, so trailing blanks are ignored.
-// Everything else must match, and an empty string never matches: an absent
-// property must not turn into a wildcard.
-static bool identityEquals(const char *actual, const char *wanted) {
-	size_t actualLength = strlen(actual);
-	while (actualLength != 0 && (actual[actualLength - 1] == ' ' || actual[actualLength - 1] == '\t'))
-		actualLength--;
+// registry copy may keep that padding, so trailing blanks are ignored. A rule
+// field of "*" matches any value; anything else must be equal, and an empty
+// device value only matches "*" — a missing property never becomes a wildcard
+// by itself.
+static size_t trimmedLength(const char *value) {
+	size_t length = strlen(value);
+	while (length != 0 && (value[length - 1] == ' ' || value[length - 1] == '\t'))
+		length--;
+	return length;
+}
 
-	size_t wantedLength = strlen(wanted);
-	while (wantedLength != 0 && (wanted[wantedLength - 1] == ' ' || wanted[wantedLength - 1] == '\t'))
-		wantedLength--;
+static bool fieldMatches(const char *actual, const char *wanted) {
+	if (wanted[0] == '*' && wanted[1] == '\0')
+		return true;
 
+	size_t actualLength = actual != nullptr ? trimmedLength(actual) : 0;
+	size_t wantedLength = trimmedLength(wanted);
 	return actualLength != 0 && actualLength == wantedLength &&
 		   strncmp(actual, wanted, actualLength) == 0;
+}
+
+// The configured rules are tried in order; the first match wins and its index is
+// what the registry reports.
+static int32_t matchIdentity(const char *model, const char *serial) {
+	for (uint32_t i = 0; i < identityCount; i++)
+		if (fieldMatches(model, identities[i].model) &&
+			fieldMatches(serial, identities[i].serial))
+			return static_cast<int32_t>(i);
+	return -1;
+}
+
+static void appendTo(char *buffer, size_t size, const char *text) {
+	size_t used = strlen(buffer);
+	if (used + 1 >= size)
+		return;
+	strlcpy(buffer + used, text, size - used);
+}
+
+static void publishConfig() {
+	char report[480];
+	snprintf(report, sizeof(report), "state=%s; identities=%u", configState, identityCount);
+	for (uint32_t i = 0; i < identityCount; i++) {
+		char entry[128];
+		snprintf(entry, sizeof(entry), "; [%u] model=%s serial=%s",
+				 i, identities[i].model, identities[i].serial);
+		appendTo(report, sizeof(report), entry);
+	}
+	publishStatus("NvmeHookConfig", report);
+}
+
+// Read the device list from the plugin's own personality once. The instance may
+// not exist yet when the first discard arrives, in which case the identity stays
+// unresolved and is retried on the next event: the rules are never guessed.
+static void loadIdentities() {
+	if (configLoaded)
+		return;
+
+	auto instance = ADDPR(selfInstance);
+	if (instance == nullptr) {
+		configState = "plugin service not started";
+		return;
+	}
+
+	configLoaded = true;
+	auto array = OSDynamicCast(OSArray, instance->getProperty(kDevicesKey));
+	if (array == nullptr) {
+		configState = "NvmeHookDevices missing from Info.plist";
+		publishConfig();
+		return;
+	}
+
+	uint32_t entries = array->getCount();
+	for (uint32_t i = 0; i < entries && identityCount < kMaxIdentities; i++) {
+		auto entry = OSDynamicCast(OSDictionary, array->getObject(i));
+		if (entry == nullptr)
+			continue;
+		auto model = OSDynamicCast(OSString, entry->getObject("Model"));
+		auto serial = OSDynamicCast(OSString, entry->getObject("Serial"));
+		if (model == nullptr || serial == nullptr)
+			continue;
+		strlcpy(identities[identityCount].model, model->getCStringNoCopy(), kModelLength);
+		strlcpy(identities[identityCount].serial, serial->getCStringNoCopy(), kSerialLength);
+		identityCount++;
+	}
+
+	configState = identityCount != 0 ? "ok" : "no usable entry in NvmeHookDevices";
+	publishConfig();
+	SYSLOG("nvmehook", "config: %s, %u identity(ies) from Info.plist", configState, identityCount);
 }
 
 static Counters *countersFor(IOService *device) {
@@ -233,21 +311,27 @@ static Counters *countersFor(IOService *device) {
 // on the first call; if it is not, the decision stays open and is retried on
 // the next event instead of being guessed.
 static void resolveIdentity(Counters *c) {
+	loadIdentities();
+	if (!configLoaded)
+		return;
+
 	const char *model = identityPropertyValue(c->device, keyModel, "Product Name");
 	const char *serial = identityPropertyValue(c->device, keySerial, keySerial);
 	if (model == nullptr || serial == nullptr)
 		return;
 
 	c->identityKnown = true;
-	c->matched = identityEquals(model, activeIdentity->model) &&
-				 identityEquals(serial, activeIdentity->serial);
+	c->identityIndex = matchIdentity(model, serial);
 
 	char key[40];
 	snprintf(key, sizeof(key), "NvmeHookDevice%u", c->index);
-	char value[512];
-	snprintf(value, sizeof(value), "model=%s; serial=%s; match=%s%s", model, serial,
-			 c->matched ? activeIdentity->role : "none",
-			 c->matched && !blockingEnabled ? " (blocking disabled)" : "");
+	char value[384];
+	if (c->identityIndex >= 0)
+		snprintf(value, sizeof(value), "model=%s; serial=%s; match=[%d] model=%s serial=%s",
+				 model, serial, c->identityIndex,
+				 identities[c->identityIndex].model, identities[c->identityIndex].serial);
+	else
+		snprintf(value, sizeof(value), "model=%s; serial=%s; match=none", model, serial);
 	publishStatus(key, value);
 	SYSLOG("nvmehook", "device %u: %s", c->index, value);
 }
@@ -296,7 +380,7 @@ static IOReturn doUnmapHook(void *self, IOBlockStorageDeviceExtent *extents,
 		if (!c->identityKnown)
 			resolveIdentity(c);
 
-		bool block = c->identityKnown && c->matched && blockingEnabled;
+		bool block = c->identityKnown && c->identityIndex >= 0;
 		if (block)
 			bump(&c->blocked);
 
@@ -330,19 +414,18 @@ static IOReturn doUnmapNVMeHook(void *self, void *request, IOBlockStorageDeviceE
 
 // Controller-level identity report, from the controller's own properties. The
 // hook above decides per block storage device; this one says, once per start,
-// whether the active identity is present on the bus at all.
+// which configured rule (if any) this controller falls under.
 static void reportControllerIdentity(IOService *controller) {
 	const char *model = stringProperty(controller, keyModel);
 	const char *serial = stringProperty(controller, keySerial);
-	bool matched = identityEquals(model, activeIdentity->model) &&
-				   identityEquals(serial, activeIdentity->serial);
+	loadIdentities();
+	int32_t matched = configLoaded ? matchIdentity(model, serial) : -1;
 
 	char report[320];
-	if (matched) {
+	if (matched >= 0) {
 		snprintf(report, sizeof(report),
-				 "matched %s controller (model=%s; serial=%s); %s", activeIdentity->role, model, serial,
-				 blockingEnabled ? "discards are suppressed"
-								 : "blocking disabled by -nvmehooknoblock");
+				 "matched rule [%d] (model=%s; serial=%s) on controller model=%s serial=%s; discards are suppressed",
+				 matched, identities[matched].model, identities[matched].serial, model, serial);
 	} else {
 		snprintf(report, sizeof(report),
 				 "pass-through controller (model=%s; serial=%s)", model, serial);
@@ -506,8 +589,7 @@ static void workerThread(void *, wait_result_t) {
 		// succeeded, the driver is reporting traffic it cannot suppress.
 		char state[192];
 		if (orgDoUnmap != 0 && orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
-			snprintf(state, sizeof(state), "armed by anchor: doUnmap (blocking %s) + counters + InitializeController",
-					 blockingEnabled ? "on" : "off");
+			snprintf(state, sizeof(state), "armed by anchor: doUnmap + counters + InitializeController");
 		} else if (orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
 			snprintf(state, sizeof(state), "counters armed but doUnmap unresolved, nothing is blocked");
 		} else if (orgDoUnmapNVMe != 0) {
@@ -572,27 +654,20 @@ static void patchersReady(void *, KernelPatcher &patcher) {
 }
 
 static void chefStart() {
-	if (argumentPassed(bootargControl, arrsize(bootargControl)))
-		activeIdentity = &identityControl;
-	if (argumentPassed(bootargNoBlock, arrsize(bootargNoBlock)))
-		blockingEnabled = false;
-
 	publishStatus("NvmeHookVersion", xStringify(MODULE_VERSION));
-	publishStatus("NvmeHookPatches", blockingEnabled
-					  ? "discard suppression for the matched device, anchor-resolved (M2)"
-					  : "counters only, anchor-resolved (-nvmehooknoblock)");
+	publishStatus("NvmeHookPatches", "discard suppression for the configured devices, anchor-resolved (M2)");
 	publishStatus("NvmeHookTotal", "seen=0; blocked=0; dsm=0");
 
-	char identity[192];
-	snprintf(identity, sizeof(identity), "match=%s model=%s serial=%s; blocking %s",
-			 activeIdentity->role, activeIdentity->model, activeIdentity->serial,
-			 blockingEnabled ? "enabled" : "disabled by -nvmehooknoblock");
-	publishStatus("NvmeHookBlocking", identity);
+	// The list usually is not readable yet (the plugin's IOService has not been
+	// instantiated when the kext starts); whoever reads it later publishes it.
+	loadIdentities();
+	publishConfig();
 
 	reportBus();
 	lilu.onPatcherLoad(patchersReady);
 
-	SYSLOG("nvmehook", "%s %s loaded; %s", xStringify(PRODUCT_NAME), xStringify(MODULE_VERSION), identity);
+	SYSLOG("nvmehook", "%s %s loaded; %u identity(ies) configured", xStringify(PRODUCT_NAME),
+		   xStringify(MODULE_VERSION), identityCount);
 }
 
 PluginConfiguration ADDPR(config) = {

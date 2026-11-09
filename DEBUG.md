@@ -6,8 +6,8 @@ A Lilu plugin with no IOKit personality of its own beyond the shell Lilu
 supplies. Three parts:
 
 1. `chefStart` (`PluginConfiguration::pluginStart` in `NvmeHook/NvmeHook.cpp`)
-   reads the two optional boot-args, publishes the version, the active identity
-   and the blocking state, scans the bus for controllers, and registers
+   publishes the version, tries to read the rule list from the plugin's own
+   personality, scans the bus for controllers, and registers
    `onPatcherLoad`.
 2. `patchersReady` gets Lilu's `KernelPatcher` and starts a kernel thread.
 3. `workerThread` waits for an `IONVMeController`, derives the three hook
@@ -108,21 +108,50 @@ The answer is resolved once per device and cached in the counters table;
 are not published yet. It is never guessed: a device whose identity is unknown
 passes through.
 
-Matching is model **and** serial, both compared after dropping trailing blanks,
-because NVMe Identify strings are space padded to a fixed width. An empty or
-absent property never matches — otherwise a missing key would become a wildcard
-and block a healthy device.
+### The rule list comes from Info.plist
 
-One identity is active at a time, chosen from two constants and a boot-arg:
+There is no device name in the source. The rules live in this kext's own
+`Info.plist`, inside the personality dictionary:
 
-| Identity | Model | Serial | Selected by |
-|---|---|---|---|
-| `target` (default) | `INTEL SSDPD21K750GAM` | `PHKD9344003J750F` | default |
-| `control` | `WD_BLACK AN1500` | `WUBT21431655` | `-nvmehookcontrol` |
+```xml
+<key>IOKitPersonalities</key>
+<dict>
+  <key>com.ling.NvmeHook</key>
+  <dict>
+    ...
+    <key>NvmeHookDevices</key>
+    <array>
+      <dict>
+        <key>Model</key>  <string>INTEL SSDPD21K750GAM</string>
+        <key>Serial</key> <string>*</string>
+      </dict>
+    </array>
+  </dict>
+</dict>
+```
 
-`-nvmehooknoblock` keeps every hook armed and every counter moving but never
-short-circuits a request, which is the regression configuration.
-`-nvmehookoff` stops Lilu from loading the plugin at all.
+IOKit copies personality keys onto the service instance, so `loadIdentities`
+reads the array from `ADDPR(selfInstance)` and copies up to `kMaxIdentities` (4)
+entries into fixed buffers. Nothing allocates and no file is opened: the values
+arrive through the registry, which is the one channel available to a kext at
+that point in boot. If the instance does not exist yet when the first discard
+arrives, the identity stays unresolved and is retried on the next event.
+
+Several rules are allowed and they are tried in order; the first match wins and
+its index is what the registry reports. A field of `*` matches any value, which
+is how a model-only rule is expressed — the shipped rule is
+`INTEL SSDPD21K750GAM` / `*`, so every drive of that model is covered. To pin a
+unit instead, put its serial in place of the `*`; to cover several devices, add
+dicts to the array.
+
+Comparison drops trailing blanks from both sides, because NVMe Identify strings
+are space padded to a fixed width. An empty or absent *device* value only
+matches `*`; it never satisfies a literal rule, so a missing property cannot
+turn into a wildcard by accident.
+
+Loading the plugin is the only switch: there is no boot argument that changes
+matching or blocking. `-nvmehookoff` remains the Lilu-level switch that stops
+the plugin from loading at all, for recovery.
 
 ### Costs on the request path
 
@@ -146,13 +175,13 @@ Published on `IOResources` unless stated otherwise:
 | Property | Meaning |
 |---|---|
 | `NvmeHookVersion` | `MODULE_VERSION` from `Scripts/build-noxcode.sh` |
-| `NvmeHookPatches` | `discard suppression for the matched device, symbol-resolved (M2)`, or the counters-only wording under `-nvmehooknoblock` |
-| `NvmeHookBlocking` | active identity and whether blocking is on: `match=target model=… serial=…; blocking enabled` |
+| `NvmeHookPatches` | `discard suppression for the configured devices, anchor-resolved (M2)` |
+| `NvmeHookConfig` | the rule list as read from `Info.plist`: `state=ok; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*`, or the reason it could not be read |
 | `NvmeHookTotal` | aggregate `seen=…; blocked=…; dsm=…` over all devices, republished on every event |
 | `NvmeHookBus` | result of the plugin-start scan, e.g. `0 controller(s) visible at plugin start` |
 | `NvmeHookWorker` | `started` when the worker thread exists |
-| `NvmeHookDevice<n>` | one per block storage device seen on the request path: `model=…; serial=…; match=target\|control\|none` |
-| `NvmeHookTarget` | on each controller and on `IOResources`: matched or pass-through, with model and serial |
+| `NvmeHookDevice<n>` | one per block storage device seen on the request path: `model=…; serial=…; match=[i] model=… serial=…` or `match=none` |
+| `NvmeHookTarget` | on each controller and on `IOResources`: which rule matched (`matched rule [i] …`) or `pass-through controller …` |
 | `NvmeHookController<n>` | written during the plugin-start scan if a controller is already published |
 | `NvmeHookCounters` | **on the block storage device itself**: `seen=…; blocked=…; dsm=…`, throttled |
 
@@ -165,7 +194,7 @@ Resolution diagnostics, one set per boot:
 | `NvmeHookAnchor` | per instance: the vptr, the three candidates it implies, and `fingerprint=match` / `mismatch` / `skipped (foreign image)` |
 | `NvmeHookVptr` | the vptr that became the anchor |
 | `NvmeHookSymDoUnmap` / `…NVMe` / `…InitializeController` | runtime addresses of the three hooks, derived from the anchor |
-| `NvmeHookHooks` | which hooks routed, and whether blocking is on |
+| `NvmeHookHooks` | which of the three hooks routed |
 
 Setting properties on `IOResources` also appends their names to the
 `IOResourceMatched` array, because that array is how IOResources advertises what
@@ -175,16 +204,19 @@ it can match. This is expected, not a leak.
 
 ```sh
 kextstat | grep -iE 'nvmehook|IONVMeFamily'
-ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Blocking|Hooks|Total|KcStage)'
+ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Config|Hooks|Total|Anchor)'
 ioreg -r -c IONVMeBlockStorageDevice -l -w0 | grep -E 'NvmeHookCounters'
 ```
 
 `ioreg -n IOResources` prints a large blob; the grep is required, not optional.
 
-The gates the counters are read against:
+`NvmeHookConfig` must read `state=ok; identities=…` with the rules that were
+intended: if it says the key is missing, the `Info.plist` edit did not reach the
+injected bundle, and nothing will be blocked.
 
-- pass-through (`-nvmehooknoblock`): `seen` and `dsm` rise together;
-- blocking: `seen` rises, `blocked` equals `seen`, `dsm` stays at zero.
+The gate the counters are read against: `seen` rises, `blocked` equals `seen`,
+`dsm` stays at zero. (`dsm` rising together with `seen` means the device is not
+matched at all — check `NvmeHookDevice<n>`.)
 
 `NvmeHookAnchor` must read `fingerprint=match`, and
 `NvmeHookVptr - NvmeHookSymDoUnmap` must be `0x1AC8A`. Both are independent of

@@ -36,6 +36,15 @@
 			<string>IOResources</string>
 			<key>IOResourceMatch</key>
 			<string>IOKit</string>
+			<key>NvmeHookDevices</key>
+			<array>
+				<dict>
+					<key>Model</key>
+					<string>INTEL SSDPD21K750GAM</string>
+					<key>Serial</key>
+					<string>*</string>
+				</dict>
+			</array>
 		</dict>
 	</dict>
 	<key>OSBundleCompatibleVersion</key>

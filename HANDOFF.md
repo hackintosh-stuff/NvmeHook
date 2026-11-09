@@ -1,6 +1,6 @@
 # NvmeHook — handoff notes
 
-Date: 2026-11-09. Driver version: 1.2.0 (deployed on the target machine). Read
+Date: 2026-11-10. Driver version: 1.3.0 (deployed on the target machine). Read
 `PLAN.md` (what and why), `AGENTS.md` (repo conventions and test device rules)
 and `DEBUG.md` (driver shape, IORegistry report, debugging) before touching
 anything. This file carries what those three do not: the state of the deployed
@@ -21,23 +21,32 @@ ling@192.168.50.204` (key auth, no password). sudo on that box is passwordless.
 The Debian rescue system answers on the same address with a different host key;
 reach it with `-o "HostKeyAlias=oc-rescue-usb"` and the rescue `known_hosts`.
 
-The deployed binary is built from the repo sources at version 1.2.0. `README.md`
+The deployed binary is built from the repo sources at version 1.3.0. `README.md`
 and `DEBUG.md` describe the current driver; see §5.
+
+The suppressed devices are **not** in the source: they are listed in the kext's
+`Info.plist` (`IOKitPersonalities > com.ling.NvmeHook > NvmeHookDevices`), so the
+existing bundle on the ESP can be edited and rebooted without a rebuild. Several
+rules are allowed, `*` means "any value", and there is no boot argument that
+changes matching — loading the plugin applies the rules. `-nvmehookoff` stays as
+the Lilu-level switch that prevents loading.
 
 ## 2. What is deployed and what is verified
 
-Deployed: **1.2.0**, anchor-resolved (§4). It suppresses discards for the one
-device whose model and serial match the active identity, and counts everything.
+Deployed: **1.3.0**, anchor-resolved (§4), with the rules read from `Info.plist`.
+It suppresses discards for every device matching a rule and counts everything.
 The target is the only NVMe controller present:
 
 ```
-NvmeHookVersion   = 1.2.0
-NvmeHookPatches   = discard suppression for the matched device, anchor-resolved (M2)
-NvmeHookBlocking  = match=target model=INTEL SSDPD21K750GAM serial=PHKD9344003J750F; blocking enabled
-NvmeHookHooks     = armed by anchor: doUnmap (blocking on) + counters + InitializeController
-NvmeHookAnchor    = i=0 vptr=0xffffff8018eeb020 doUnmap=0xffffff8018ed0396
-                    doUnmapNVMe=0xffffff8018ed016c init=0xffffff8018ec290c fingerprint=match
-NvmeHookTotal     = seen=0; blocked=0; dsm=0
+NvmeHookVersion   = 1.3.0
+NvmeHookPatches   = discard suppression for the configured devices, anchor-resolved (M2)
+NvmeHookConfig    = state=ok; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*
+NvmeHookHooks     = armed by anchor: doUnmap + counters + InitializeController
+NvmeHookAnchor    = i=0 vptr=0xffffff801baeb020 doUnmap=0xffffff801bad0396
+                    doUnmapNVMe=0xffffff801bad016c init=0xffffff801bac290c fingerprint=match
+NvmeHookDevice0   = model=INTEL SSDPD21K750GAM; serial=PHKD9344003J750F;
+                    match=[0] model=INTEL SSDPD21K750GAM serial=*
+NvmeHookTotal     = seen=6; blocked=6; dsm=0
 ```
 
 Stages, in the order they were run:
@@ -289,10 +298,13 @@ What is left is upkeep rather than testing:
    re-measure them (§4) and confirm `NvmeHookAnchor` still reads
    `fingerprint=match`; a mismatch means the driver is inert, not that it is
    working.
-2. The target now carries an empty APFS volume `NvmeHookTest` (750 GB container).
+2. The shipped rule is `INTEL SSDPD21K750GAM` / `*`, i.e. **model only**: any
+   further drive of that model would be suppressed too, healthy or not. Put the
+   serial in place of the `*` to pin the one sample, and add dicts to the array
+   for more devices. After editing `NvmeHookDevices` on the ESP, confirm
+   `NvmeHookConfig` lists what was intended — a malformed list leaves the driver
+   loaded but matching nothing.
+3. The target now carries an empty APFS volume `NvmeHookTest` (750 GB container).
    It can be kept, renamed or erased as ordinary storage.
-3. The pass-through case (control device under the target identity) has not been
-   re-observed on 1.2.0; it follows from the constant comparison and is worth one
-   look whenever both drives are attached.
 4. `-nvmehookoff` remains the kill switch and must stay reachable; the recovery
    procedure in §7 works whether or not the driver is at fault.
