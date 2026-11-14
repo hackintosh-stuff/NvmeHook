@@ -5,9 +5,8 @@ specific devices whose firmware does not survive it, while every other NVMe
 device keeps TRIM unchanged.
 
 Target device: a 750 GB Intel Optane `SSDPD21K750GAM`. Its firmware drops off the
-bus when it receives TRIM and takes the machine with it. Only that sample is
-faulty; the other NVMe device in the machine is healthy and serves as the
-control.
+bus when it receives TRIM and takes the machine with it. If you wonder what it is,
+read this: [Bought a modified D4800X](https://note.com/mushroomy/n/nb44a6695a608?hl=en)
 
 ## State
 
