@@ -10,10 +10,18 @@ read this: [Bought a modified D4800X](https://note.com/mushroomy/n/nb44a6695a608
 
 ## State
 
-Milestone M2. Discards are suppressed for every device that matches a rule in the
+Milestone M3. Discards are suppressed for every device that matches a rule in the
 kext's `Info.plist`, at the point where a storage discard would become an NVMe
 Dataset Management command; every other NVMe device reaches the original
 implementation unchanged, byte for byte.
+
+The interception points are read from the running `IONVMeFamily` slice's own
+symbol table, by exact mangled name, with the slide recovered from the image
+itself. No build constant is involved, so an IONVMeFamily update that keeps those
+symbols keeps the driver working; the measured offsets survive only as the
+fallback for a slice without a symbol table, and the distances observed at run
+time are published next to them (`NvmeHookLayout`) so drift is visible instead of
+silent.
 
 The suppression is measured, not assumed. Three counters are published per
 device: `seen` (discards entering the filter), `blocked` (of those, the ones
@@ -30,9 +38,11 @@ discards swallowed, none reaching the hardware — and `diskutil verifyVolume`
 clean at the end. `DEBUG.md` carries the implementation, the property table and
 the way the hooks are resolved.
 
-The hooks are found from a live `IONVMeController` and fingerprinted before use,
-so the driver never reads the file system and a build whose code does not match
-makes it inert instead of dangerous.
+The hooks are resolved from a live `IONVMeController`: its vtable pointer leads to
+the slice, the slice's symbol table names the three functions, and the constants
+with their fingerprints are only the fallback. The driver never reads the file
+system, and a slice whose symbols are gone and whose code no longer matches the
+measured build makes it inert instead of dangerous.
 
 ## Configuration
 
@@ -123,9 +133,16 @@ fails.
 
 ```sh
 kextstat | grep -iE 'nvmehook|IONVMeFamily'
-ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Blocking|Hooks|Total)'
+ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Config|Resolve|Layout|Hooks|Total)'
 ioreg -r -c IONVMeBlockStorageDevice -l -w0 | grep NvmeHookCounters
 ```
+
+`NvmeHookResolve` must name the path that won: `resolved by symbols …; symbol
+path: ok` is the healthy reading, `resolved by constants` means the symbol table
+was not usable and the reason follows. `NvmeHookLayout` reports the distances
+observed at run time and whether they still equal the measured constants; `no`
+means the slice has been rebuilt and the constants (and the fingerprints) need
+re-measuring — the driver keeps working from the symbols in that case.
 
 The kernel log is not a usable record here: it is a ring buffer that ordinary
 boot traffic overwrites within a minute. `DEBUG.md` explains the IORegistry

@@ -180,9 +180,11 @@ Always published:
 | Property | Meaning |
 |---|---|
 | `NvmeHookVersion` | `MODULE_VERSION` from `Scripts/build-noxcode.sh` |
-| `NvmeHookPatches` | `discard suppression for the configured devices, anchor-resolved (M2)` |
+| `NvmeHookPatches` | `discard suppression for the configured devices, symbol-resolved (M3)` |
 | `NvmeHookConfig` | the rule list as read from `Info.plist`: `state=ok; debug=off; identities=1; [0] model=INTEL SSDPD21K750GAM serial=*`, or the reason it could not be read |
-| `NvmeHookHooks` | which of the three hooks routed (`armed by anchor: doUnmap + counters + InitializeController`) |
+| `NvmeHookResolve` | which resolution path won and why: `resolved by symbols across 1 controller(s); symbol path: ok` |
+| `NvmeHookLayout` | the distances observed at run time next to the measured ones: `source=symbols; doUnmap=-0x1ac8a; doUnmapNVMe=-0x1aeb4; init=-0x28714; matches measured constants=yes` |
+| `NvmeHookHooks` | which of the three hooks routed (`armed by symbols: doUnmap + counters + InitializeController`) |
 | `NvmeHookTotal` | aggregate `seen=…; blocked=…; dsm=…` over all devices, republished on every event |
 
 Only with `NvmeHookDebug = true`:
@@ -197,9 +199,12 @@ Only with `NvmeHookDebug = true`:
 | `NvmeHookCounters` | **on the block storage device itself**: `seen=…; blocked=…; dsm=…`, throttled |
 | `NvmeHookInstanceCount` | `IONVMeController` instances found by the worker |
 | `NvmeHookVptr<n>` | first word of instance `<n>` — its vtable pointer |
-| `NvmeHookAnchor` | per instance: the vptr, the three candidates it implies, and `fingerprint=match` / `mismatch` / `skipped (foreign image)` |
-| `NvmeHookVptr` | the vptr that became the anchor |
-| `NvmeHookSymDoUnmap` / `…NVMe` / `…InitializeController` | runtime addresses of the three hooks, derived from the anchor |
+| `NvmeHookSymbols` | per instance: the slice the vptr resolved to, its slide, its symbol count and the four resolved addresses |
+| `NvmeHookSymbolsResult` | the same line repeated for the instance that won |
+| `NvmeHookScan` | one entry per page that carried the Mach-O magic during the header scan, with the reason it was accepted or rejected |
+| `NvmeHookAnchor` | per instance, fallback path: the vptr, the three candidates it implies, and `fingerprint=match` / `mismatch` / `skipped (foreign image)` |
+| `NvmeHookVptr` | the vtable slot that became the anchor |
+| `NvmeHookSymDoUnmap` / `…NVMe` / `…InitializeController` | runtime addresses of the three hooks |
 
 Two `IOResourceMatched` entries come from `Info.plist` itself rather than from
 the driver: `NvmeHookDevices` and `NvmeHookDebug` are personality keys, and IOKit
@@ -231,9 +236,16 @@ The gate the counters are read against: `seen` rises, `blocked` equals `seen`,
 `dsm` stays at zero. (`dsm` rising together with `seen` means the device is not
 matched at all — check `NvmeHookDevice<n>`.)
 
-With `NvmeHookDebug` on, `NvmeHookAnchor` must read `fingerprint=match`, and
-`NvmeHookVptr - NvmeHookSymDoUnmap` must be `0x1AC8A`. Both are independent of
-the slide, so they catch a wrong anchor even when the addresses look plausible.
+`NvmeHookResolve` must say which path was taken and why. `resolved by symbols
+…; symbol path: ok` is the healthy reading; `resolved by constants` names the
+reason the symbol path gave up (`no Mach-O header below the vptr`, `implausible
+slide`, `symbol table parsed but the names are missing`, …), and with the debug
+switch on `NvmeHookScan` shows the pages the header scan examined.
+
+`NvmeHookVptr - NvmeHookSymDoUnmap` must be `0x1AC8A` on the fallback path, and
+`NvmeHookLayout` reports the same three distances for whichever path won; they
+are independent of the slide, so they catch a wrong anchor even when the
+addresses look plausible.
 
 Two invariants make a bad reading obvious: `blocked` never exceeds `seen`, and
 `dsm` on a blocked device stays flat across unmount/remount, bulk deletes and a
@@ -246,11 +258,12 @@ soak.
 Dead ends, all verified on this machine:
 
 1. **Lilu `solveSymbol` does not work on Tahoe at all** — neither for kexts nor
-   for the kernel. Kext slices in the collection are not resolvable by Lilu
-   1.7.2 (its `kcGetRunningAddresses` looks for a literal `__LINKEDIT` segment;
-   Tahoe names the shared symbol region `__LINKEDIT_hidden`), and
-   collection-builtin kexts report `kmod_info->address = 0`, so the kext
-   callback hands the plugin a zero base.
+   for the kernel. Collection-builtin kexts report `kmod_info->address = 0`, and
+   the kext callback hands the plugin a zero base, which is enough to fail every
+   request on its own. Note that the slices themselves are not the obstacle: an
+   IONVMeFamily slice still declares a `__LINKEDIT` segment and still carries
+   `LC_SYMTAB` (verified against the running collection), which is what makes the
+   symbol path in `workerThread` possible without Lilu.
 2. **Scanning kernel VM is banned.** A version that walked VM pages to find the
    outer collection header panicked in the wild (unmapped gap between the base
    collection and the OpenCore-injected slices).
@@ -273,32 +286,49 @@ Dead ends, all verified on this machine:
    one; the serial console only changed the timing enough to expose it. Do not
    reintroduce `vnode_lookup`, `vn_rdwr` or any path lookup here.
 
-The working design:
+The working design, in the order it is tried:
 
 1. Block in `waitForMatchingService` on the worker thread until an
-   `IONVMeController` exists.
-2. The instance's first word is its vptr, i.e. `__ZTV16IONVMeController + 16`
-   plus the slide. Every hook is a fixed link-time distance from that slot:
-   `hook = vptr + (hook link address - (__ZTV link address + 16))`, so the slide
-   never has to be computed and no address is read from disk. The distances are
-   `kDelta*` at the top of `NvmeHook.cpp`.
-3. Each candidate is read for 24 bytes and compared with `kFingerprint*`,
-   measured on the same build. Twenty-four and not sixteen: the two block-device
-   prologues share their first sixteen bytes and only diverge where they save
-   their arguments.
-4. Before that read, each candidate must be within 4 MB of the vtable's first
-   slot, which is a pointer into the same image. A foreign subclass vtable is
-   skipped instead of being read, so a fingerprint read can never land in an
-   unmapped gap.
-5. The first instance that fingerprints cleanly becomes the anchor; only then
-   does `routeFunction` run. A mismatch publishes
-   `NvmeHookAnchor … fingerprint=mismatch` and patches nothing.
+   `IONVMeController` exists. Its first word is the vptr of a real instance.
+2. **Symbols first.** Page-align the vptr and walk down page by page, stopping at
+   the first page that carries `MH_MAGIC_64` and parses as a kext Mach-O whose
+   first segment is `__TEXT` and which contains the vptr itself. That page is the
+   slice's header. Its `LC_SYMTAB` is then walked for the four exact mangled
+   names (`doUnmap`, `doUnmapNVMe`, `InitializeController`,
+   `__ZTV16IONVMeController`); a name that matches lands as an address, offset by
+   the slide, provided it falls inside one of the image's own segments. Nothing
+   here is build-specific, so an IONVMeFamily update that keeps the symbols keeps
+   the driver armed.
+   - **The slide is zero in this collection.** Kernel collections rebase the
+     load commands *and* the symbol values together, so at run time
+     `__TEXT.vmaddr` already reads as the runtime address and `n_value` is
+     already a runtime address. Both a zero slide and a non-zero one are
+     therefore accepted, and the "is the vptr inside this image" test is what
+     decides whether a candidate header is real. Requiring `slide > 0` looks
+     reasonable and is wrong: it rejects every boot on Tahoe and silently demotes
+     the driver to the fallback.
+   - Match exactly. The slice also contains `…doUnmap….cold.1` fragments and
+     `AppleNVMeController::InitializeController`; a substring match would patch a
+     fragment or the wrong class.
+3. **Constants second.** `hook = vptr + kDelta*`, where the deltas are
+   `hook link address - (__ZTV link address + 16)` measured on macOS 26.7.2 /
+   25G332, and each candidate must be within 4 MB of the vtable's first slot
+   before it is read. Each candidate is then compared with 24 bytes of
+   `kFingerprint*`. Twenty-four and not sixteen: the two block-device prologues
+   share their first sixteen bytes and only diverge where they save their
+   arguments.
+4. The first instance that resolves becomes the anchor; only then does
+   `routeFunction` run. Whatever the outcome, `NvmeHookResolve` names the path and
+   the reason, `NvmeHookLayout` prints the distances observed next to the measured
+   ones, and a build that matches neither path patches nothing.
 
-The constants belong to macOS 26.7.2 / 25G332. An IONVMeFamily update that moves
-or recompiles these functions makes the fingerprints fail: visible and safe, but
-it also means no protection, so re-measure the `kDelta*`/`kFingerprint*` values
-(`vt_slots.py` and `fn_bytes.py` in the `ida/` analysis directory do exactly
-that) after any change to that kext.
+The constants remain useful as a cross-check: `NvmeHookLayout … matches measured
+constants=yes` says this build is still the one they came from, `no` says the
+slice has been rebuilt and the constants and fingerprints need re-measuring —
+while the symbol path keeps carrying the driver. The offline tools for that are
+`ida/kc_ztv_layout.py` (vtable/slice layout) and `ida/kc_storage_vtable_check.py`
+(vtable slots and IOBlockStorageDevice ABI), which read
+`BootKernelExtensions.kc` directly.
 
 ## Deploy and recovery
 

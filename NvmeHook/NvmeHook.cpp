@@ -38,6 +38,15 @@
 //      "*" is accepted as "any value" in either field. There is no boot-arg
 //      switch any more: loading the plugin means its rules apply.
 //
+//  M3: the distances are no longer the only way in. A Tahoe IONVMeFamily slice
+//      keeps LC_SYMTAB and the three targets are external symbols in it, so the
+//      addresses are read from the image's own symbol table by exact mangled
+//      name and the slide is recovered from the same live object. Nothing there
+//      depends on a build constant, which is what makes an IONVMeFamily update
+//      survivable; the constants stay as the second path for a stripped slice,
+//      and the deltas observed at run time are published next to them so drift
+//      is visible instead of silent.
+//
 //  The report is published to the IORegistry, not the kernel log: the ring
 //  buffer is overwritten by boot traffic within a minute, while registry
 //  properties stay readable for the whole boot.
@@ -122,8 +131,10 @@ static const char *keyVendor = "Vendor Identifier";
 //
 //     hook = vptr + (hook link address - (__ZTV link address + 16))
 //
-// and the KASLR slide cancels out. A different build changes these numbers,
-// which is what the fingerprints below exist to catch.
+// and the KASLR slide cancels out. These are the fallback path now: the symbol
+// table is consulted first, and these are used only when it is unavailable. A
+// different build changes these numbers, which is what the fingerprints below
+// exist to catch.
 static constexpr int64_t kDeltaDoUnmap = -0x1AC8A;
 static constexpr int64_t kDeltaDoUnmapNVMe = -0x1AEB4;
 static constexpr int64_t kDeltaInitializeController = -0x28714;
@@ -145,6 +156,313 @@ static const uint8_t kFingerprintInitializeController[kFingerprintLength] {
 	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89,
 	0xfb, 0x48, 0x8b, 0x07, 0xff, 0x90, 0x88, 0x0a, 0x00, 0x00, 0x85, 0xc0,
 };
+
+// ---------------------------------------------------------------------------
+// Primary resolution: the slice's own symbol table.
+//
+// The constants above are one build's snapshot. The driver is not limited to it:
+// an IONVMeFamily slice in a kernel collection carries LC_SYMTAB, and the three
+// functions are external symbols (N_SECT|N_EXT) in it, so they can be found by
+// name. What is missing on Tahoe is a way to get the slide, not the table:
+// Lilu's solveSymbol resolves through kmod_info->address, which collection-built
+// kexts report as zero. The slide is recovered here from the live object that
+// anchors everything else: its vptr points into this slice, so page-aligning
+// down from it lands on the Mach-O header within a few hundred kilobytes, and
+// slide = header address - __TEXT.vmaddr.
+//
+// Only memory that is mapped by construction is read: the pages between the
+// header and the vptr are the slice's own segments, laid out contiguously. The
+// scan stops at the first Mach-O magic, so a false hit fails the whole path
+// instead of walking past the image start.
+// ---------------------------------------------------------------------------
+static constexpr uint32_t kMachMagic64 = 0xFEEDFACF;
+static constexpr uint32_t kCpuTypeX86_64 = 0x01000007;
+static constexpr uint32_t kFileTypeKextBundle = 0xB;
+static constexpr uint32_t kLoadCmdSegment64 = 0x19;
+static constexpr uint32_t kLoadCmdSymtab = 0x2;
+static constexpr uint32_t kMaxSliceSegments = 8;
+static constexpr uint32_t kMaxSliceScanPages = 256;
+static constexpr uint32_t kMaxLoadCommands = 32;
+static constexpr uint32_t kMaxLoadCommandsSize = 0x4000;
+static constexpr uint32_t kMaxSymbols = 200000;
+
+static const char *symDoUnmap =
+	"__ZN24IONVMeBlockStorageDevice7doUnmapEP26IOBlockStorageDeviceExtentjj";
+static const char *symDoUnmapNVMe =
+	"__ZN24IONVMeBlockStorageDevice11doUnmapNVMeEP16AppleNVMeRequestP26IOBlockStorageDeviceExtentjP17NVMeLBARangeEntry";
+static const char *symInitializeController = "__ZN16IONVMeController20InitializeControllerEv";
+static const char *symControllerVtable = "__ZTV16IONVMeController";
+
+static inline uint32_t readU32(const uint8_t *p) {
+	uint32_t value;
+	memcpy(&value, p, sizeof(value));
+	return value;
+}
+
+static inline uint64_t readU64(const uint8_t *p) {
+	uint64_t value;
+	memcpy(&value, p, sizeof(value));
+	return value;
+}
+
+// Bounded compare: the string table is a shared blob and the last string in it
+// is not guaranteed to be terminated inside the declared size.
+static bool nameEquals(const char *actual, const char *wanted, uint32_t limit) {
+	for (uint32_t i = 0; i < limit; i++) {
+		if (actual[i] != wanted[i])
+			return false;
+		if (wanted[i] == '\0')
+			return true;
+	}
+	return false;
+}
+
+struct SliceSegment {
+	char name[17];
+	uint64_t vmaddr {0};
+	uint64_t vmsize {0};
+	uint64_t fileoff {0};
+	uint64_t filesize {0};
+};
+
+struct Slice {
+	mach_vm_address_t base {0};
+	int64_t slide {0};
+	SliceSegment segments[kMaxSliceSegments] {};
+	uint32_t segmentCount {0};
+	uint32_t symoff {0};
+	uint32_t symbolCount {0};
+	uint32_t stroff {0};
+	uint32_t strsize {0};
+	bool hasSymtab {false};
+};
+
+// Why the symbol path gave up, for the registry report. One string per boot;
+// without it a fallback to the constants is indistinguishable from a driver
+// that never tried.
+static const char *sliceReason = "not attempted";
+
+// Per-page record of the header scan: which page carried the magic and why it
+// was rejected. Diagnostic only, published once when the debug switch is on.
+static char scanTrace[256];
+static uint32_t scanTraceLength {0};
+
+static void traceReject(mach_vm_address_t page, const char *reason) {
+	if (scanTraceLength >= sizeof(scanTrace))
+		return;
+	char entry[80];
+	snprintf(entry, sizeof(entry), "0x%llx:%s; ", static_cast<unsigned long long>(page), reason);
+	size_t length = strlen(entry);
+	if (scanTraceLength + length >= sizeof(scanTrace))
+		return;
+	memcpy(scanTrace + scanTraceLength, entry, length + 1);
+	scanTraceLength += static_cast<uint32_t>(length);
+}
+
+static bool parseSlice(mach_vm_address_t header, mach_vm_address_t containing, Slice *slice) {
+	auto bytes = reinterpret_cast<const uint8_t *>(header);
+	uint32_t filetype = readU32(bytes + 12);
+	uint32_t ncmds = readU32(bytes + 16);
+	uint32_t sizeofcmds = readU32(bytes + 20);
+
+	if (readU32(bytes) != kMachMagic64 || readU32(bytes + 4) != kCpuTypeX86_64 ||
+		filetype != kFileTypeKextBundle) {
+		sliceReason = "magic without a kext header";
+		return false;
+	}
+	if (ncmds == 0 || ncmds > kMaxLoadCommands || sizeofcmds < 8 ||
+		sizeofcmds > kMaxLoadCommandsSize) {
+		sliceReason = "load command header out of range";
+		return false;
+	}
+
+	Slice parsed {};
+	parsed.base = header;
+
+	uint32_t offset = 32; // sizeof(mach_header_64)
+	uint32_t limit = 32 + sizeofcmds;
+	for (uint32_t i = 0; i < ncmds; i++) {
+		if (offset + 8 > limit) {
+			sliceReason = "load commands overrun their size";
+			return false;
+		}
+		uint32_t cmd = readU32(bytes + offset);
+		uint32_t size = readU32(bytes + offset + 4);
+		if (size < 8 || offset + size > limit) {
+			sliceReason = "malformed load command";
+			return false;
+		}
+
+		if (cmd == kLoadCmdSegment64) {
+			if (size < 72 || parsed.segmentCount >= kMaxSliceSegments) {
+				sliceReason = "unusable segment command";
+				return false;
+			}
+			auto &segment = parsed.segments[parsed.segmentCount++];
+			memcpy(segment.name, bytes + offset + 8, 16);
+			segment.name[16] = '\0';
+			segment.vmaddr = readU64(bytes + offset + 24);
+			segment.vmsize = readU64(bytes + offset + 32);
+			segment.fileoff = readU64(bytes + offset + 40);
+			segment.filesize = readU64(bytes + offset + 48);
+		} else if (cmd == kLoadCmdSymtab) {
+			if (size < 24) {
+				sliceReason = "truncated symbol table command";
+				return false;
+			}
+			parsed.symoff = readU32(bytes + offset + 8);
+			parsed.symbolCount = readU32(bytes + offset + 12);
+			parsed.stroff = readU32(bytes + offset + 16);
+			parsed.strsize = readU32(bytes + offset + 20);
+			parsed.hasSymtab = true;
+		}
+
+		offset += size;
+	}
+
+	if (parsed.segmentCount == 0 || strcmp(parsed.segments[0].name, "__TEXT") != 0) {
+		sliceReason = "first segment is not __TEXT";
+		return false;
+	}
+	if (!parsed.hasSymtab) {
+		sliceReason = "slice has no LC_SYMTAB";
+		return false;
+	}
+	if (parsed.symbolCount == 0 || parsed.symbolCount > kMaxSymbols || parsed.strsize == 0) {
+		sliceReason = "empty symbol table";
+		return false;
+	}
+
+	// The header sits at the start of __TEXT, so the difference is the slide the
+	// image was loaded at. Zero is allowed: a collection that has already rebased
+	// the load commands reports its runtime address as the link address, and the
+	// symbol values are rebased with it, so the same arithmetic holds.
+	int64_t slide = static_cast<int64_t>(header) - static_cast<int64_t>(parsed.segments[0].vmaddr);
+	if (slide < -0x40000000 || slide > 0x40000000 || (slide & 0xFFF) != 0) {
+		sliceReason = "implausible slide";
+		return false;
+	}
+
+	// The object we started from has to be inside this image under that slide.
+	// This is what rejects a page that merely looks like a header.
+	bool inside = false;
+	for (uint32_t i = 0; i < parsed.segmentCount && !inside; i++) {
+		const auto &segment = parsed.segments[i];
+		auto start = static_cast<mach_vm_address_t>(
+			slide + static_cast<int64_t>(segment.vmaddr));
+		inside = containing >= start && containing < start + segment.vmsize;
+	}
+	if (!inside) {
+		sliceReason = "anchor is not inside this image";
+		return false;
+	}
+
+	parsed.slide = slide;
+
+	*slice = parsed;
+	sliceReason = "ok";
+	return true;
+}
+
+// Scan down from a live pointer inside the slice until its Mach-O header shows
+// up. Every page in between belongs to the same image, whose segments are
+// contiguous, so nothing outside the mapping is read. A page that starts with
+// the magic but does not parse is skipped, not fatal: a constant in __TEXT can
+// look like a header, and the real one is always further down.
+static bool sliceForAddress(mach_vm_address_t address, Slice *slice) {
+	if ((address >> 48) != 0xffff) {
+		sliceReason = "vptr is not a kernel address";
+		return false;
+	}
+
+	scanTraceLength = 0;
+	scanTrace[0] = '\0';
+
+	uint32_t rejected = 0;
+	mach_vm_address_t page = address & ~static_cast<mach_vm_address_t>(0xFFF);
+	for (uint32_t i = 0; i < kMaxSliceScanPages; i++, page -= 0x1000) {
+		if (page < 0x100000) {
+			sliceReason = "scan left the address space";
+			return false;
+		}
+		if (readU32(reinterpret_cast<const uint8_t *>(page)) != kMachMagic64)
+			continue;
+		if (parseSlice(page, address, slice)) {
+			traceReject(page, "accepted");
+			return true;
+		}
+		traceReject(page, sliceReason);
+		// Bounded: after a few rejects the pages below are no longer known to be
+		// part of this image, so the scan stops rather than reading them.
+		if (++rejected >= 4)
+			return false;
+	}
+
+	if (rejected == 0)
+		sliceReason = "no Mach-O header below the vptr";
+	return false;
+}
+
+// A file offset from the load commands is valid only inside the segment that
+// owns it; the slices of a collection do not share one flat file image.
+static bool runtimeFromFileOffset(const Slice &slice, uint32_t fileoff, uint64_t length,
+								  mach_vm_address_t *address) {
+	for (uint32_t i = 0; i < slice.segmentCount; i++) {
+		const auto &segment = slice.segments[i];
+		if (segment.filesize == 0)
+			continue;
+		if (fileoff < segment.fileoff || fileoff + length > segment.fileoff + segment.filesize)
+			continue;
+		*address = static_cast<mach_vm_address_t>(
+			slice.slide + static_cast<int64_t>(segment.vmaddr) +
+			static_cast<int64_t>(fileoff - segment.fileoff));
+		return true;
+	}
+	return false;
+}
+
+// Exact match on the mangled name. Substring matching would also accept the
+// .cold.N clones (which are function fragments, not entry points) and the same
+// method of a sibling class, and patching either of those is a panic.
+static mach_vm_address_t lookupSymbol(const Slice &slice, const char *wanted) {
+	if (!slice.hasSymtab)
+		return 0;
+
+	mach_vm_address_t symtab = 0;
+	mach_vm_address_t strtab = 0;
+	if (!runtimeFromFileOffset(slice, slice.symoff,
+							   static_cast<uint64_t>(slice.symbolCount) * 16, &symtab))
+		return 0;
+	if (!runtimeFromFileOffset(slice, slice.stroff, slice.strsize, &strtab))
+		return 0;
+
+	auto strings = reinterpret_cast<const char *>(strtab);
+	auto entry = reinterpret_cast<const uint8_t *>(symtab);
+	for (uint32_t i = 0; i < slice.symbolCount; i++, entry += 16) {
+		uint32_t nameIndex = readU32(entry);
+		if (nameIndex == 0 || nameIndex >= slice.strsize)
+			continue;
+		if ((entry[4] & 0x0e) != 0x0e) // N_SECT only: no undefined, no absolute
+			continue;
+		if (!nameEquals(strings + nameIndex, wanted, slice.strsize - nameIndex))
+			continue;
+
+		auto value = static_cast<mach_vm_address_t>(
+			static_cast<int64_t>(readU64(entry + 8)) + slice.slide);
+
+		// Whatever the table says, the result has to be inside this image.
+		for (uint32_t s = 0; s < slice.segmentCount; s++) {
+			const auto &segment = slice.segments[s];
+			auto start = static_cast<mach_vm_address_t>(
+				slice.slide + static_cast<int64_t>(segment.vmaddr));
+			if (value >= start && value < start + segment.vmsize)
+				return value;
+		}
+		return 0;
+	}
+
+	return 0;
+}
 
 static mach_vm_address_t orgDoUnmap {0};
 static mach_vm_address_t orgDoUnmapNVMe {0};
@@ -559,11 +877,59 @@ static void workerThread(void *, wait_result_t) {
 	mach_vm_address_t addressDoUnmap {0};
 	mach_vm_address_t addressDoUnmapNVMe {0};
 	mach_vm_address_t addressInitializeController {0};
+	const char *source = "constants";
 
-	// Probe every instance. The candidates are constant distances from the
-	// vptr, so they are inside the same image whatever the slide is; the
-	// fingerprints then say whether this image is the build the distances were
-	// measured on. The first instance that matches is the anchor.
+	// Path A: the slice's own symbol table. Nothing here depends on a build
+	// constant, so an IONVMeFamily update that keeps these symbols keeps the
+	// driver armed without touching the source. The instance vptr is used only
+	// to locate the slice and recover its slide.
+	char symbolProbe[320];
+	symbolProbe[0] = '\0';
+	for (uint32_t i = 0; i < instanceCount && anchor == 0; i++) {
+		auto vptr = *reinterpret_cast<uintptr_t *>(instances[i]);
+		Slice slice {};
+		if (!sliceForAddress(vptr, &slice))
+			continue;
+
+		auto resolvedDoUnmap = lookupSymbol(slice, symDoUnmap);
+		auto resolvedDoUnmapNVMe = lookupSymbol(slice, symDoUnmapNVMe);
+		auto resolvedInitializeController = lookupSymbol(slice, symInitializeController);
+		auto resolvedVtable = lookupSymbol(slice, symControllerVtable);
+
+		snprintf(symbolProbe, sizeof(symbolProbe),
+				 "i=%u vptr=0x%llx slice=0x%llx slide=0x%llx syms=%u doUnmap=0x%llx doUnmapNVMe=0x%llx init=0x%llx ztv=0x%llx",
+				 i, static_cast<unsigned long long>(vptr),
+				 static_cast<unsigned long long>(slice.base),
+				 static_cast<unsigned long long>(slice.slide), slice.symbolCount,
+				 static_cast<unsigned long long>(resolvedDoUnmap),
+				 static_cast<unsigned long long>(resolvedDoUnmapNVMe),
+				 static_cast<unsigned long long>(resolvedInitializeController),
+				 static_cast<unsigned long long>(resolvedVtable));
+		publishDebug("NvmeHookSymbols", symbolProbe);
+
+		if (resolvedDoUnmap == 0 || resolvedDoUnmapNVMe == 0 ||
+			resolvedInitializeController == 0 || resolvedVtable == 0) {
+			sliceReason = "symbol table parsed but the names are missing";
+			continue;
+		}
+
+		// The vtable symbol points at offset-to-top, so the vptr is two words in;
+		// anchoring there keeps the deltas below comparable with the constants.
+		anchor = resolvedVtable + 2 * sizeof(uintptr_t);
+		addressDoUnmap = resolvedDoUnmap;
+		addressDoUnmapNVMe = resolvedDoUnmapNVMe;
+		addressInitializeController = resolvedInitializeController;
+		source = "symbols";
+	}
+
+	if (anchor == 0 && scanTrace[0] != '\0')
+		publishDebug("NvmeHookScan", scanTrace);
+
+	// Path B: the constants, used when the table is not there (a stripped slice,
+	// or an image the header scan could not reach). The candidates are constant
+	// distances from the vptr, so they are inside the same image whatever the
+	// slide is; the fingerprints then say whether this image is the build the
+	// distances were measured on. The first instance that matches is the anchor.
 	for (uint32_t i = 0; i < instanceCount && anchor == 0; i++) {
 		auto vptr = *reinterpret_cast<uintptr_t *>(instances[i]);
 		auto candidateDoUnmap = static_cast<mach_vm_address_t>(
@@ -611,11 +977,20 @@ static void workerThread(void *, wait_result_t) {
 	}
 
 	if (anchor == 0) {
-		publishStatus("NvmeHookHooks", "no controller matches the measured layout, nothing patched");
+		publishStatus("NvmeHookHooks", "neither symbols nor the measured layout matched, nothing patched");
 		goto releaseInstances;
 	}
 
 	{
+		// The reason is published even when symbols won, so a future fallback is
+		// one grep away instead of an inference.
+		char report[384];
+		snprintf(report, sizeof(report), "resolved by %s across %u controller(s); symbol path: %s",
+				 source, instanceCount, sliceReason);
+		publishStatus("NvmeHookResolve", report);
+		if (symbolProbe[0] != '\0')
+			publishDebug("NvmeHookSymbolsResult", symbolProbe);
+
 		publishDebugAddress("NvmeHookVptr", anchor);
 		publishDebugAddress("NvmeHookSymDoUnmap", addressDoUnmap);
 		publishDebugAddress("NvmeHookSymDoUnmapNVMe", addressDoUnmapNVMe);
@@ -628,22 +1003,47 @@ static void workerThread(void *, wait_result_t) {
 		orgInitializeController = gPatcher->routeFunction(addressInitializeController,
 														  reinterpret_cast<mach_vm_address_t>(initializeControllerHook), true);
 
+		// The measured constants are the yardstick, not the input: reporting the
+		// observed distances next to them shows whether this build still is the
+		// one they came from, and how far a future build has drifted.
+		int64_t deltaDoUnmap = static_cast<int64_t>(addressDoUnmap) - static_cast<int64_t>(anchor);
+		int64_t deltaDoUnmapNVMe = static_cast<int64_t>(addressDoUnmapNVMe) - static_cast<int64_t>(anchor);
+		int64_t deltaInitializeController = static_cast<int64_t>(addressInitializeController) -
+										   static_cast<int64_t>(anchor);
+		bool matchesMeasured = deltaDoUnmap == kDeltaDoUnmap &&
+							   deltaDoUnmapNVMe == kDeltaDoUnmapNVMe &&
+							   deltaInitializeController == kDeltaInitializeController;
+
+		char layout[256];
+		snprintf(layout, sizeof(layout),
+				 "source=%s; doUnmap=%s%llx; doUnmapNVMe=%s%llx; init=%s%llx; matches measured constants=%s",
+				 source,
+				 deltaDoUnmap < 0 ? "-0x" : "0x",
+				 static_cast<unsigned long long>(deltaDoUnmap < 0 ? -deltaDoUnmap : deltaDoUnmap),
+				 deltaDoUnmapNVMe < 0 ? "-0x" : "0x",
+				 static_cast<unsigned long long>(deltaDoUnmapNVMe < 0 ? -deltaDoUnmapNVMe : deltaDoUnmapNVMe),
+				 deltaInitializeController < 0 ? "-0x" : "0x",
+				 static_cast<unsigned long long>(deltaInitializeController < 0 ? -deltaInitializeController
+																		  : deltaInitializeController),
+				 matchesMeasured ? "yes" : "no");
+		publishStatus("NvmeHookLayout", layout);
+
 		// doUnmap is the hook that can drop a request, so it is named first and
 		// called out separately: if it failed to route while the counter hook
 		// succeeded, the driver is reporting traffic it cannot suppress.
-		char state[192];
+		char state[224];
 		if (orgDoUnmap != 0 && orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
-			snprintf(state, sizeof(state), "armed by anchor: doUnmap + counters + InitializeController");
+			snprintf(state, sizeof(state), "armed by %s: doUnmap + counters + InitializeController", source);
 		} else if (orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
-			snprintf(state, sizeof(state), "counters armed but doUnmap unresolved, nothing is blocked");
+			snprintf(state, sizeof(state), "counters armed by %s but doUnmap unresolved, nothing is blocked", source);
 		} else if (orgDoUnmapNVMe != 0) {
-			snprintf(state, sizeof(state), "counters armed; doUnmap and InitializeController unresolved");
+			snprintf(state, sizeof(state), "counters armed by %s; doUnmap and InitializeController unresolved", source);
 		} else {
 			snprintf(state, sizeof(state), "routing failed, nothing patched");
 		}
 
 		publishStatus("NvmeHookHooks", state);
-		SYSLOG("nvmehook", "hooks: %s", state);
+		SYSLOG("nvmehook", "hooks: %s; layout: %s", state, layout);
 	}
 
 releaseInstances:
@@ -701,7 +1101,7 @@ static void patchersReady(void *, KernelPatcher &patcher) {
 
 static void chefStart() {
 	publishStatus("NvmeHookVersion", xStringify(MODULE_VERSION));
-	publishStatus("NvmeHookPatches", "discard suppression for the configured devices, anchor-resolved (M2)");
+	publishStatus("NvmeHookPatches", "discard suppression for the configured devices, symbol-resolved (M3)");
 	publishStatus("NvmeHookTotal", "seen=0; blocked=0; dsm=0");
 
 	// The rules usually are not readable yet (the plugin's IOService has not been
