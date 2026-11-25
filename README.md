@@ -16,12 +16,11 @@ Dataset Management command; every other NVMe device reaches the original
 implementation unchanged, byte for byte.
 
 The interception points are read from the running `IONVMeFamily` slice's own
-symbol table, by exact mangled name, with the slide recovered from the image
-itself. No build constant is involved, so an IONVMeFamily update that keeps those
-symbols keeps the driver working; the measured offsets survive only as the
-fallback for a slice without a symbol table, and the distances observed at run
-time are published next to them (`NvmeHookLayout`) so drift is visible instead of
-silent.
+symbol table, by exact mangled name, with the slice base recovered from the image
+itself. Nothing build-specific is compiled in, so an IONVMeFamily update that
+keeps those symbols keeps the driver working, and there is no table of measured
+offsets waiting to go stale in its place. The distances observed at run time are
+published (`NvmeHookLayout`) for the record.
 
 The suppression is measured, not assumed. Three counters are published per
 device: `seen` (discards entering the filter), `blocked` (of those, the ones
@@ -39,10 +38,9 @@ clean at the end. `DEBUG.md` carries the implementation, the property table and
 the way the hooks are resolved.
 
 The hooks are resolved from a live `IONVMeController`: its vtable pointer leads to
-the slice, the slice's symbol table names the three functions, and the constants
-with their fingerprints are only the fallback. The driver never reads the file
-system, and a slice whose symbols are gone and whose code no longer matches the
-measured build makes it inert instead of dangerous.
+the slice, and the slice's symbol table names the three functions. The driver
+never reads the file system, and a slice whose symbols are gone makes it inert
+instead of dangerous.
 
 ## Configuration
 
@@ -79,7 +77,7 @@ IORegistry. It is `false` by default, and absent means `false`.
 | value | what is published |
 |---|---|
 | `false` | `NvmeHookVersion`, `NvmeHookPatches`, `NvmeHookConfig`, `NvmeHookHooks`, `NvmeHookTotal` |
-| `true` | the above plus the anchor and resolved hook addresses, the instance count, the bus scan, the worker state, the per-controller match report and the per-device match report with its own counter |
+| `true` | the above plus the resolved hook addresses, the slice and symbol-table readings, the header-scan trace, the instance count, the bus scan, the worker state, the per-controller match report and the per-device match report with its own counter |
 
 Diagnostic properties cost a registry write each, which is why they are opt-in;
 the counters in `NvmeHookTotal` are always published because they are the proof
@@ -137,12 +135,12 @@ ioreg -n IOResources -l -w0 | grep -E 'NvmeHook(Version|Patches|Config|Resolve|L
 ioreg -r -c IONVMeBlockStorageDevice -l -w0 | grep NvmeHookCounters
 ```
 
-`NvmeHookResolve` must name the path that won: `resolved by symbols …; symbol
-path: ok` is the healthy reading, `resolved by constants` means the symbol table
-was not usable and the reason follows. `NvmeHookLayout` reports the distances
-observed at run time and whether they still equal the measured constants; `no`
-means the slice has been rebuilt and the constants (and the fingerprints) need
-re-measuring — the driver keeps working from the symbols in that case.
+`NvmeHookResolve` has to read `resolved by symbols …; symbol path: ok`. Anything
+else carries the reason it failed — `no Mach-O header below the vptr`,
+`implausible slide`, `symbol table parsed but the names are missing` — and means
+nothing was patched. `NvmeHookLayout` prints the distances between the vtable
+slot and each hook in the running image, plus the slice and its symbol count, for
+the record.
 
 The kernel log is not a usable record here: it is a ring buffer that ordinary
 boot traffic overwrites within a minute. `DEBUG.md` explains the IORegistry

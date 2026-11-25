@@ -13,18 +13,12 @@
 //      scanning kernel VM for the collection header faulted in the wild.
 //      Everything is anchored to a live object instead: the first word of an
 //      IONVMeController is its vptr, an address inside IONVMeFamily, and the
-//      hooks are a fixed link-time distance away from it, so the KASLR slide
-//      cancels out.
-//  M1.9: the earlier version resolved those distances by reading
-//      BootKernelExtensions.kc through vnode_lookup/vn_rdwr from its own kernel
-//      thread. That path panicked in namei ("Taking non-sleepable RW lock with
-//      preemption enabled") when boot timing moved, because a bare kernel
-//      thread has no VFS context. The driver no longer touches the file
-//      system: the distances are constants measured from the same collection,
-//      and each candidate is fingerprinted (24 leading code bytes) before
-//      anything is routed. A build whose code does not match aborts with a
-//      status instead of patching, which is the one thing the symbol approach
-//      did better and the reason the fingerprints are checked at all.
+//      slice's own Mach-O header sits a few hundred kilobytes below it.
+//  M1.9: an earlier version read BootKernelExtensions.kc through
+//      vnode_lookup/vn_rdwr from its own kernel thread. That path panicked in
+//      namei ("Taking non-sleepable RW lock with preemption enabled") when boot
+//      timing moved, because a bare kernel thread has no VFS context. The driver
+//      no longer touches the file system, and never will.
 //
 //  M2: the matched device loses every discard. The decision is taken in
 //      doUnmap, before the original acquires the work-loop gate, allocates the
@@ -38,14 +32,14 @@
 //      "*" is accepted as "any value" in either field. There is no boot-arg
 //      switch any more: loading the plugin means its rules apply.
 //
-//  M3: the distances are no longer the only way in. A Tahoe IONVMeFamily slice
-//      keeps LC_SYMTAB and the three targets are external symbols in it, so the
-//      addresses are read from the image's own symbol table by exact mangled
-//      name and the slide is recovered from the same live object. Nothing there
-//      depends on a build constant, which is what makes an IONVMeFamily update
-//      survivable; the constants stay as the second path for a stripped slice,
-//      and the deltas observed at run time are published next to them so drift
-//      is visible instead of silent.
+//  M3: the interception points come from the image's own symbol table. A Tahoe
+//      IONVMeFamily slice keeps LC_SYMTAB and the three targets are external
+//      symbols in it, so they are looked up by exact mangled name, with the
+//      slice base recovered from the same live object. Nothing build-specific is
+//      compiled in, which is what makes an IONVMeFamily update survivable, and
+//      there is no second path on measured offsets: such a table describes one
+//      build, cannot tell a rebuilt slice from a misresolution, and a driver that
+//      keeps patching on it hides the defect instead of reporting it.
 //
 //  The report is published to the IORegistry, not the kernel log: the ring
 //  buffer is overwritten by boot traffic within a minute, while registry
@@ -125,55 +119,32 @@ static const char *keyModel = "Model Number";
 static const char *keySerial = "Serial Number";
 static const char *keyVendor = "Vendor Identifier";
 
-// Distance from an IONVMeController's vptr to each hook, measured in this
-// collection (macOS 26.7.2, 25G332, com.apple.iokit.IONVMeFamily). The vptr is
-// __ZTV16IONVMeController + 2 * sizeof(uintptr_t), so
-//
-//     hook = vptr + (hook link address - (__ZTV link address + 16))
-//
-// and the KASLR slide cancels out. These are the fallback path now: the symbol
-// table is consulted first, and these are used only when it is unavailable. A
-// different build changes these numbers, which is what the fingerprints below
-// exist to catch.
-static constexpr int64_t kDeltaDoUnmap = -0x1AC8A;
-static constexpr int64_t kDeltaDoUnmapNVMe = -0x1AEB4;
-static constexpr int64_t kDeltaInitializeController = -0x28714;
-
-// The first 24 code bytes of each hook. Twenty-four and not sixteen: the two
-// block-device prologues share their first sixteen bytes and only diverge where
-// they save their arguments. Checked before routing, so a build that moved
-// these functions aborts instead of patching something else.
-static constexpr uint32_t kFingerprintLength = 24;
-static const uint8_t kFingerprintDoUnmap[kFingerprintLength] {
-	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
-	0x53, 0x48, 0x83, 0xec, 0x28, 0x89, 0xcb, 0x41, 0x89, 0xd6, 0x49, 0x89,
-};
-static const uint8_t kFingerprintDoUnmapNVMe[kFingerprintLength] {
-	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
-	0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0x75, 0xc0, 0x48, 0x89, 0x7d,
-};
-static const uint8_t kFingerprintInitializeController[kFingerprintLength] {
-	0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89,
-	0xfb, 0x48, 0x8b, 0x07, 0xff, 0x90, 0x88, 0x0a, 0x00, 0x00, 0x85, 0xc0,
-};
-
 // ---------------------------------------------------------------------------
-// Primary resolution: the slice's own symbol table.
+// Resolution: the slice's own symbol table.
 //
-// The constants above are one build's snapshot. The driver is not limited to it:
-// an IONVMeFamily slice in a kernel collection carries LC_SYMTAB, and the three
+// An IONVMeFamily slice in a kernel collection carries LC_SYMTAB, and the three
 // functions are external symbols (N_SECT|N_EXT) in it, so they can be found by
-// name. What is missing on Tahoe is a way to get the slide, not the table:
+// name. What is missing on Tahoe is a way to get the slice's base, not the table:
 // Lilu's solveSymbol resolves through kmod_info->address, which collection-built
-// kexts report as zero. The slide is recovered here from the live object that
-// anchors everything else: its vptr points into this slice, so page-aligning
-// down from it lands on the Mach-O header within a few hundred kilobytes, and
-// slide = header address - __TEXT.vmaddr.
+// kexts report as zero. The base is recovered from the live object that anchors
+// everything else: its vptr points into this slice, so page-aligning down from it
+// lands on the Mach-O header within a few hundred kilobytes.
+//
+// This collection rebases the load commands and the symbol values together, so
+// __TEXT.vmaddr already reads as a runtime address and the slide computes to
+// zero. Zero and non-zero are both accepted; what decides whether a candidate
+// header is real is that the anchor object lies inside the image it declares.
 //
 // Only memory that is mapped by construction is read: the pages between the
-// header and the vptr are the slice's own segments, laid out contiguously. The
-// scan stops at the first Mach-O magic, so a false hit fails the whole path
-// instead of walking past the image start.
+// header and the vptr are the slice's own segments, laid out contiguously. A page
+// that starts with the magic but does not parse is skipped, with a bound, because
+// a constant inside __TEXT can look like a header.
+//
+// There is deliberately no fallback to measured offsets and code fingerprints.
+// Such a table only ever describes one build of the kext, it cannot tell a
+// rebuilt slice from a misresolution, and a driver that keeps patching on it
+// hides the resolution defect instead of reporting it. If the names are not
+// there, nothing is patched and the registry says why.
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kMachMagic64 = 0xFEEDFACF;
 static constexpr uint32_t kCpuTypeX86_64 = 0x01000007;
@@ -799,25 +770,13 @@ static IOReturn initializeControllerHook(void *self) {
 	reportControllerIdentity(static_cast<IOService *>(self));
 	return result;
 }
-// Read the leading code bytes of a resolved hook and compare them with the
-// fingerprint measured on the build these distances came from. Reading the
-// candidate is safe by construction: it is a small constant offset from a live
-// vptr, so it lands in the same image that pointer belongs to.
-static bool fingerprintMatches(mach_vm_address_t address, const uint8_t *expected) {
-	auto bytes = reinterpret_cast<const uint8_t *>(address);
-	for (uint32_t i = 0; i < kFingerprintLength; i++)
-		if (bytes[i] != expected[i])
-			return false;
-	return true;
-}
-
 // Resolve every interception point and route the hooks. Runs on a worker
-// thread once an IONVMeController exists, because every address is expressed
-// relative to that live object's vtable pointer. Instances are probed in turn:
-// the first published controller is not necessarily driven by IONVMeFamily
-// (this machine has also carried a RAID card), and a subclass would have a
-// different vtable at a different distance, so the fingerprints decide which
-// instance is the anchor, not the enumeration order.
+// thread once an IONVMeController exists, because the slice is found from that
+// live object's vtable pointer. Instances are probed in turn: the first
+// published controller is not necessarily driven by IONVMeFamily (this machine
+// has also carried a RAID card), and a subclass would carry a different vtable,
+// so the symbol table decides which instance is the anchor, not the enumeration
+// order.
 static void workerThread(void *, wait_result_t) {
 	auto matching = IOService::serviceMatching("IONVMeController");
 	if (matching == nullptr) {
@@ -874,15 +833,17 @@ static void workerThread(void *, wait_result_t) {
 		reportControllerIdentity(instances[i]);
 
 	mach_vm_address_t anchor {0};
+	mach_vm_address_t anchorSlice {0};
+	uint32_t anchorSymbols {0};
+	int64_t anchorSlide {0};
 	mach_vm_address_t addressDoUnmap {0};
 	mach_vm_address_t addressDoUnmapNVMe {0};
 	mach_vm_address_t addressInitializeController {0};
-	const char *source = "constants";
 
-	// Path A: the slice's own symbol table. Nothing here depends on a build
-	// constant, so an IONVMeFamily update that keeps these symbols keeps the
-	// driver armed without touching the source. The instance vptr is used only
-	// to locate the slice and recover its slide.
+	// The slice's own symbol table is the only source. Nothing here depends on a
+	// build constant, so an IONVMeFamily update that keeps these symbols keeps the
+	// driver armed without touching the source. The instance vptr is used only to
+	// locate the slice.
 	char symbolProbe[320];
 	symbolProbe[0] = '\0';
 	for (uint32_t i = 0; i < instanceCount && anchor == 0; i++) {
@@ -913,80 +874,35 @@ static void workerThread(void *, wait_result_t) {
 			continue;
 		}
 
-		// The vtable symbol points at offset-to-top, so the vptr is two words in;
-		// anchoring there keeps the deltas below comparable with the constants.
+		// The vtable symbol points at offset-to-top, so the vptr is two words in.
 		anchor = resolvedVtable + 2 * sizeof(uintptr_t);
+		anchorSlice = slice.base;
+		anchorSymbols = slice.symbolCount;
+		anchorSlide = slice.slide;
 		addressDoUnmap = resolvedDoUnmap;
 		addressDoUnmapNVMe = resolvedDoUnmapNVMe;
 		addressInitializeController = resolvedInitializeController;
-		source = "symbols";
 	}
 
 	if (anchor == 0 && scanTrace[0] != '\0')
 		publishDebug("NvmeHookScan", scanTrace);
 
-	// Path B: the constants, used when the table is not there (a stripped slice,
-	// or an image the header scan could not reach). The candidates are constant
-	// distances from the vptr, so they are inside the same image whatever the
-	// slide is; the fingerprints then say whether this image is the build the
-	// distances were measured on. The first instance that matches is the anchor.
-	for (uint32_t i = 0; i < instanceCount && anchor == 0; i++) {
-		auto vptr = *reinterpret_cast<uintptr_t *>(instances[i]);
-		auto candidateDoUnmap = static_cast<mach_vm_address_t>(
-			static_cast<int64_t>(vptr) + kDeltaDoUnmap);
-		auto candidateDoUnmapNVMe = static_cast<mach_vm_address_t>(
-			static_cast<int64_t>(vptr) + kDeltaDoUnmapNVMe);
-		auto candidateInitializeController = static_cast<mach_vm_address_t>(
-			static_cast<int64_t>(vptr) + kDeltaInitializeController);
-
-		// The vtable is mapped by definition, and its first entry is a method
-		// in the same image. Anything further than 4 MB from that method is not
-		// this image, so it is skipped instead of being read: a fingerprint
-		// read is only safe inside a mapping we know exists.
-		auto firstMethod = static_cast<int64_t>(reinterpret_cast<const uintptr_t *>(vptr)[0]);
-		auto nearAnchorImage = [&](mach_vm_address_t candidate) {
-			auto delta = static_cast<int64_t>(candidate) - firstMethod;
-			return delta > -0x400000 && delta < 0x400000;
-		};
-
-		bool near = nearAnchorImage(candidateDoUnmap) &&
-					nearAnchorImage(candidateDoUnmapNVMe) &&
-					nearAnchorImage(candidateInitializeController);
-		bool matched = near &&
-					   fingerprintMatches(candidateDoUnmap, kFingerprintDoUnmap) &&
-					   fingerprintMatches(candidateDoUnmapNVMe, kFingerprintDoUnmapNVMe) &&
-					   fingerprintMatches(candidateInitializeController, kFingerprintInitializeController);
-
-		char probe[224];
-		snprintf(probe, sizeof(probe),
-				 "i=%u vptr=0x%llx doUnmap=0x%llx doUnmapNVMe=0x%llx init=0x%llx fingerprint=%s",
-				 i, static_cast<unsigned long long>(vptr),
-				 static_cast<unsigned long long>(candidateDoUnmap),
-				 static_cast<unsigned long long>(candidateDoUnmapNVMe),
-				 static_cast<unsigned long long>(candidateInitializeController),
-				 !near ? "skipped (foreign image)" : (matched ? "match" : "mismatch"));
-		publishDebug("NvmeHookAnchor", probe);
-
-		if (!matched)
-			continue;
-
-		anchor = static_cast<mach_vm_address_t>(vptr);
-		addressDoUnmap = candidateDoUnmap;
-		addressDoUnmapNVMe = candidateDoUnmapNVMe;
-		addressInitializeController = candidateInitializeController;
-	}
-
 	if (anchor == 0) {
-		publishStatus("NvmeHookHooks", "neither symbols nor the measured layout matched, nothing patched");
+		char report[256];
+		snprintf(report, sizeof(report),
+				 "symbol resolution failed across %u controller(s): %s; nothing patched",
+				 instanceCount, sliceReason);
+		publishStatus("NvmeHookResolve", report);
+		publishStatus("NvmeHookHooks", "no interception point resolved, nothing patched");
 		goto releaseInstances;
 	}
 
 	{
-		// The reason is published even when symbols won, so a future fallback is
-		// one grep away instead of an inference.
-		char report[384];
-		snprintf(report, sizeof(report), "resolved by %s across %u controller(s); symbol path: %s",
-				 source, instanceCount, sliceReason);
+		// Published even when resolution succeeded, so the reason a slice had to be
+		// skipped on another instance is not lost.
+		char report[256];
+		snprintf(report, sizeof(report), "resolved by symbols across %u controller(s); symbol path: %s",
+				 instanceCount, sliceReason);
 		publishStatus("NvmeHookResolve", report);
 		if (symbolProbe[0] != '\0')
 			publishDebug("NvmeHookSymbolsResult", symbolProbe);
@@ -1003,21 +919,18 @@ static void workerThread(void *, wait_result_t) {
 		orgInitializeController = gPatcher->routeFunction(addressInitializeController,
 														  reinterpret_cast<mach_vm_address_t>(initializeControllerHook), true);
 
-		// The measured constants are the yardstick, not the input: reporting the
-		// observed distances next to them shows whether this build still is the
-		// one they came from, and how far a future build has drifted.
+		// The distances are published for the record, not compared against anything:
+		// with no stored baseline in the binary there is nothing to drift from, and
+		// whoever wants to check them against a hand-measured build has the numbers
+		// in the registry and the slice they came from beside them.
 		int64_t deltaDoUnmap = static_cast<int64_t>(addressDoUnmap) - static_cast<int64_t>(anchor);
 		int64_t deltaDoUnmapNVMe = static_cast<int64_t>(addressDoUnmapNVMe) - static_cast<int64_t>(anchor);
 		int64_t deltaInitializeController = static_cast<int64_t>(addressInitializeController) -
 										   static_cast<int64_t>(anchor);
-		bool matchesMeasured = deltaDoUnmap == kDeltaDoUnmap &&
-							   deltaDoUnmapNVMe == kDeltaDoUnmapNVMe &&
-							   deltaInitializeController == kDeltaInitializeController;
 
 		char layout[256];
 		snprintf(layout, sizeof(layout),
-				 "source=%s; doUnmap=%s%llx; doUnmapNVMe=%s%llx; init=%s%llx; matches measured constants=%s",
-				 source,
+				 "source=symbols; doUnmap=%s%llx; doUnmapNVMe=%s%llx; init=%s%llx; slice=0x%llx; slide=0x%llx; syms=%u",
 				 deltaDoUnmap < 0 ? "-0x" : "0x",
 				 static_cast<unsigned long long>(deltaDoUnmap < 0 ? -deltaDoUnmap : deltaDoUnmap),
 				 deltaDoUnmapNVMe < 0 ? "-0x" : "0x",
@@ -1025,7 +938,8 @@ static void workerThread(void *, wait_result_t) {
 				 deltaInitializeController < 0 ? "-0x" : "0x",
 				 static_cast<unsigned long long>(deltaInitializeController < 0 ? -deltaInitializeController
 																		  : deltaInitializeController),
-				 matchesMeasured ? "yes" : "no");
+				 static_cast<unsigned long long>(anchorSlice),
+				 static_cast<unsigned long long>(anchorSlide), anchorSymbols);
 		publishStatus("NvmeHookLayout", layout);
 
 		// doUnmap is the hook that can drop a request, so it is named first and
@@ -1033,11 +947,11 @@ static void workerThread(void *, wait_result_t) {
 		// succeeded, the driver is reporting traffic it cannot suppress.
 		char state[224];
 		if (orgDoUnmap != 0 && orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
-			snprintf(state, sizeof(state), "armed by %s: doUnmap + counters + InitializeController", source);
+			snprintf(state, sizeof(state), "armed: doUnmap + counters + InitializeController");
 		} else if (orgDoUnmapNVMe != 0 && orgInitializeController != 0) {
-			snprintf(state, sizeof(state), "counters armed by %s but doUnmap unresolved, nothing is blocked", source);
+			snprintf(state, sizeof(state), "counters armed but doUnmap unresolved, nothing is blocked");
 		} else if (orgDoUnmapNVMe != 0) {
-			snprintf(state, sizeof(state), "counters armed by %s; doUnmap and InitializeController unresolved", source);
+			snprintf(state, sizeof(state), "counters armed; doUnmap and InitializeController unresolved");
 		} else {
 			snprintf(state, sizeof(state), "routing failed, nothing patched");
 		}
